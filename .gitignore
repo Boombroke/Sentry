@@ -2,6 +2,7 @@ build/
 install/
 log/
 AGENTS.md
+MEMORY.md
 .cache/
 
 # 大文件（点云、地图、3D 模型等）
