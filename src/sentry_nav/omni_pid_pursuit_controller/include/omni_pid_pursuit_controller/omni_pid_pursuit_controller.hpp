@@ -266,6 +266,7 @@ private:
   rclcpp::Logger logger_{rclcpp::get_logger("OmniPidPursuitController")};
   rclcpp::Clock::SharedPtr clock_;
   double last_velocity_scaling_factor_;
+  double last_curvature_{0.0};
   mutable rclcpp::Time last_visualization_time_;  // mutable to allow modification in const methods
 
   std::shared_ptr<PID> move_pid_;

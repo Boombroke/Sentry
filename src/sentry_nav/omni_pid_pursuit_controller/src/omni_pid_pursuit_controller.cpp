@@ -538,7 +538,7 @@ bool OmniPidPursuitController::isCollisionDetected(const nav_msgs::msg::Path & p
     const auto & pose = pose_stamped.pose;
     unsigned int mx, my;
     if (costmap->worldToMap(pose.position.x, pose.position.y, mx, my)) {
-      if (costmap->getCost(mx, my) >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+      if (costmap->getCost(mx, my) >= nav2_costmap_2d::LETHAL_OBSTACLE) {
         return true;
       }
     } else {
@@ -603,66 +603,38 @@ void OmniPidPursuitController::applyCurvatureLimitation(
   const nav_msgs::msg::Path & path, const geometry_msgs::msg::PoseStamped & lookahead_pose,
   double & linear_vel)
 {
-  double curvature =
+  double raw_curvature =
     calculateCurvature(path, lookahead_pose, curvature_forward_dist_, curvature_backward_dist_);
 
-  double scaled_linear_vel = linear_vel;
-  double target_scaled_vel = linear_vel;
-  
-  // Only calculate local curvature if overall curvature is high (performance optimization)
-  // This helps detect if we're in a straight section after a turn
-  bool is_local_straight = false;
-  if (curvature > curvature_min_ && path.poses.size() >= 3) {
-    // Calculate local curvature only when needed (when overall curvature is high)
-    // Use a shorter distance for local curvature check (only look ahead, not backward)
-    double local_forward_dist = curvature_forward_dist_ * 0.5;  // Shorter lookahead for local check
-    double local_curvature = calculateCurvature(path, lookahead_pose, local_forward_dist, 0.1);
-    is_local_straight = (local_curvature <= curvature_min_);
-  } else if (curvature <= curvature_min_) {
-    // If overall curvature is already low, local path is definitely straight
-    is_local_straight = true;
-  }
-  
-  if (curvature > curvature_min_ && !is_local_straight) {
-    // Path is curved and local path is also curved, reduce speed
-    double reduction_ratio = 1.0;
+  // EMA low-pass filter on curvature to suppress noise from grid-based path jaggedness
+  constexpr double kCurvatureFilterAlpha = 0.3;
+  double curvature =
+    kCurvatureFilterAlpha * raw_curvature + (1.0 - kCurvatureFilterAlpha) * last_curvature_;
+  last_curvature_ = curvature;
+
+  double reduction_ratio = 1.0;
+  if (curvature > curvature_min_) {
     if (curvature > curvature_max_) {
       reduction_ratio = reduction_ratio_at_high_curvature_;
     } else {
       reduction_ratio = 1.0 - (curvature - curvature_min_) / (curvature_max_ - curvature_min_) *
                                 (1.0 - reduction_ratio_at_high_curvature_);
     }
-    target_scaled_vel = linear_vel * reduction_ratio;
-    
-    // Apply rate limit when reducing speed (slower reduction for safety)
-    scaled_linear_vel =
-      last_velocity_scaling_factor_ + std::clamp(
-                                        target_scaled_vel - last_velocity_scaling_factor_,
-                                        -max_velocity_scaling_factor_rate_ * control_duration_,
-                                        max_velocity_scaling_factor_rate_ * control_duration_);
-  } else {
-    // Path is straight or local path is straight (after turn), allow faster speed recovery
-    // This ensures quick acceleration after turns
-    double recovery_rate = max_velocity_scaling_factor_rate_ * 2.0;
-    target_scaled_vel = linear_vel;  // Full speed for straight path
-    scaled_linear_vel =
-      last_velocity_scaling_factor_ + std::clamp(
-                                        target_scaled_vel - last_velocity_scaling_factor_,
-                                        -max_velocity_scaling_factor_rate_ * control_duration_,
-                                        recovery_rate * control_duration_);
   }
-  
-  // Ensure minimum velocity to prevent "Failed to make progress"
-  // Use a reasonable minimum based on max velocity and approach velocity
-  double min_vel = std::max(2.0 * min_approach_linear_velocity_, v_linear_max_ * 0.1);
-  scaled_linear_vel = std::max(scaled_linear_vel, min_vel);
 
+  double target_scaled_vel = linear_vel * reduction_ratio;
+
+  double scaled_linear_vel =
+    last_velocity_scaling_factor_ + std::clamp(
+                                      target_scaled_vel - last_velocity_scaling_factor_,
+                                      -max_velocity_scaling_factor_rate_ * control_duration_,
+                                      max_velocity_scaling_factor_rate_ * control_duration_);
+
+  double min_vel = std::max(min_approach_linear_velocity_, v_linear_max_ * 0.1);
+  scaled_linear_vel = std::max(scaled_linear_vel, min_vel);
   linear_vel = std::min(linear_vel, scaled_linear_vel);
-  // Ensure linear_vel is not too small
   linear_vel = std::max(linear_vel, min_vel);
-  
-  // Save the scaled velocity (not the final linear_vel) for next iteration
-  // Ensure saved value is not too small
+
   last_velocity_scaling_factor_ = std::max(scaled_linear_vel, min_vel);
 }
 
