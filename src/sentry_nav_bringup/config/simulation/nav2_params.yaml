@@ -162,9 +162,9 @@ small_gicp_relocalization:
     use_sim_time: True
     num_threads: 4
     num_neighbors: 20
-    global_leaf_size: 0.25
-    registered_leaf_size: 0.25
-    max_dist_sq: 9.0
+    global_leaf_size: 0.2
+    registered_leaf_size: 0.1
+    max_dist_sq: 3.0
     map_frame: "map"
     odom_frame: "odom"
     base_frame: "base_footprint"
@@ -172,10 +172,10 @@ small_gicp_relocalization:
     lidar_frame: "front_mid360"
     init_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # [x, y, z, roll, pitch, yaw]
     max_iterations: 50
-    accumulated_count_threshold: 50
+    accumulated_count_threshold: 20
     min_range: 0.3
-    min_inlier_ratio: 0.1
-    max_fitness_error: 5.0
+    min_inlier_ratio: 0.3
+    max_fitness_error: 1.5
     enable_periodic_relocalization: false
     relocalization_interval: 30.0
     # The prior_pcd_file does not need to be specified since it going to be set by defaults in launch.
@@ -414,7 +414,7 @@ local_costmap:
         z_voxels: 16
         min_obstacle_height: 0.0
         max_obstacle_height: 2.0
-        min_obstacle_intensity: 0.1
+        min_obstacle_intensity: 0.2
         max_obstacle_intensity: 2.0
         observation_sources: terrain_map
         terrain_map:
@@ -461,7 +461,7 @@ global_costmap:
         z_voxels: 16
         min_obstacle_height: 0.0
         max_obstacle_height: 2.0
-        min_obstacle_intensity: 0.1
+        min_obstacle_intensity: 0.2
         max_obstacle_intensity: 2.0
         observation_sources: terrain_map_ext
         terrain_map_ext:

@@ -75,6 +75,19 @@ void SensorScanGenerationNode::laserCloudAndOdometryHandler(
   tf_odom_to_chassis = tf_odom_to_lidar * tf_lidar_to_chassis;
   tf_odom_to_robot_base = tf_odom_to_lidar * tf_lidar_to_robot_base_;
 
+  // Constrain odom→chassis to 2D (x, y, yaw) to prevent Z drift from LiDAR-inertial odometry.
+  // Point-LIO's IMU integration causes gradual Z accumulation on ground robots.
+  {
+    const auto & origin = tf_odom_to_chassis.getOrigin();
+    tf2::Quaternion q = tf_odom_to_chassis.getRotation();
+    double roll, pitch, yaw;
+    tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+    tf_odom_to_chassis.setOrigin(tf2::Vector3(origin.x(), origin.y(), 0.0));
+    tf2::Quaternion q_2d;
+    q_2d.setRPY(0.0, 0.0, yaw);
+    tf_odom_to_chassis.setRotation(q_2d);
+  }
+
   publishTransform(
     tf_odom_to_chassis, odometry_msg->header.frame_id, base_frame_, pcd_msg->header.stamp);
   publishOdometry(

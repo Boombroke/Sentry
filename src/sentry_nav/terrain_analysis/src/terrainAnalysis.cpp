@@ -604,7 +604,9 @@ int main(int argc, char **argv) {
                   planarPointElev[planarVoxelWidth * indX + indY].size();
               if (disZ >= 0 && disZ < vehicleHeight &&
                   planarPointElevSize >= minBlockPointNum) {
-                terrainCloudElev->push_back(point);
+                pcl::PointXYZI elevPoint = point;
+                elevPoint.z = 0.0f;
+                terrainCloudElev->push_back(elevPoint);
                 terrainCloudElev->points[terrainCloudElevSize].intensity = disZ;
 
                 terrainCloudElevSize++;
@@ -657,7 +659,7 @@ int main(int argc, char **argv) {
                 planarVoxelSize * (indX - planarVoxelHalfWidth) + vehicleX;
             point.y =
                 planarVoxelSize * (indY - planarVoxelHalfWidth) + vehicleY;
-            point.z = vehicleZ;
+            point.z = 0.0f;
             point.intensity = vehicleHeight;
 
             point.x -= planarVoxelSize / 4.0;

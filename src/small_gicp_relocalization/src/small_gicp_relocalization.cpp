@@ -109,6 +109,11 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
     *global_map_, global_leaf_size_);
 
+  // Project target to XY plane to match the source projection in performRegistration()
+  for (auto & pt : target_->points) {
+    pt.z = 0.0f;
+  }
+
   RCLCPP_INFO(
     this->get_logger(), "Target map after downsampling: %zu points (leaf_size=%.3f)",
     target_->size(), global_leaf_size_);
@@ -258,6 +263,13 @@ bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
     *accumulated_cloud_, registered_leaf_size_);
 
+  // Project source points to XY plane (z=0) to constrain GICP to SE(2).
+  // Without this, 6DOF GICP converges to flipped local minima (roll/pitch ≈ π)
+  // in sparse simulation point clouds.  Ground robots only need (x, y, yaw).
+  for (auto & pt : source_->points) {
+    pt.z = 0.0f;
+  }
+
   small_gicp::estimate_covariances_omp(*source_, num_neighbors_, num_threads_);
 
   source_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
@@ -340,7 +352,25 @@ bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
       this->get_logger(), "Periodic reloc: accepted correction of %.3f m", delta_dist);
   }
 
-  result_t_ = previous_result_t_ = result.T_target_source;
+  // Constrain GICP result to 2D (x, y, yaw) before storing.
+  // The raw 6DOF result may contain large roll/pitch components (especially in
+  // simulation with sparse point clouds), which can flip the transform and
+  // poison `previous_result_t_` used as the next GICP initial guess.
+  const Eigen::Vector3d raw_t = result.T_target_source.translation();
+  const Eigen::Matrix3d raw_r = result.T_target_source.rotation();
+  double yaw = std::atan2(raw_r(1, 0), raw_r(0, 0));
+
+  Eigen::Isometry3d constrained = Eigen::Isometry3d::Identity();
+  constrained.translation() << raw_t.x(), raw_t.y(), 0.0;
+  constrained.linear() =
+    Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+
+  RCLCPP_INFO(
+    this->get_logger(),
+    "Accepted 2D-constrained result: t=[%.3f, %.3f], yaw=%.3f",
+    raw_t.x(), raw_t.y(), yaw);
+
+  result_t_ = previous_result_t_ = constrained;
   return true;
 }
 

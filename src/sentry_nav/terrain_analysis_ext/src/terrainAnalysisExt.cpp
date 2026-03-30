@@ -532,7 +532,7 @@ int main(int argc, char **argv) {
               terrainCloudElev->push_back(point);
               terrainCloudElev->points[terrainCloudElevSize].x = point.x;
               terrainCloudElev->points[terrainCloudElevSize].y = point.y;
-              terrainCloudElev->points[terrainCloudElevSize].z = point.z;
+              terrainCloudElev->points[terrainCloudElevSize].z = 0.0f;
               terrainCloudElev->points[terrainCloudElevSize].intensity = disZ;
 
               terrainCloudElevSize++;
