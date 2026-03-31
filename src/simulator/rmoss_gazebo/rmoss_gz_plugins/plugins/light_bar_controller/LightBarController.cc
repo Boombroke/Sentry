@@ -21,8 +21,6 @@
 #include <ignition/gazebo/components/Link.hh>
 #include <ignition/gazebo/components/Material.hh>
 
-#include <ignition/gazebo/SdfEntityCreator.hh>
-
 #include <ignition/gazebo/Link.hh>
 #include <ignition/gazebo/Model.hh>
 #include <ignition/gazebo/Util.hh>
@@ -68,14 +66,8 @@ sdf::Material GetMaterial(int state){
 
 struct VisualEntityInfo {
     Entity entity;
-    Entity parentEntity;
-    sdf::Visual visualSdf;
-    int state;
-    VisualEntityInfo(Entity _entity,Entity parentEntity,sdf::Visual &_visualSdf,int _state)
+    VisualEntityInfo(Entity _entity)
         : entity(_entity)
-        , parentEntity(parentEntity)
-        , visualSdf(_visualSdf)
-        , state(_state)
     {
     }
 };
@@ -85,21 +77,18 @@ class ignition::gazebo::systems::LightBarControllerPrivate
 public:
     void OnCmd(const ignition::msgs::Int32 &_msg);
     void Init(ignition::gazebo::EntityComponentManager &_ecm);
-    void UpdateVisualEnitiies();
+    void ApplyMaterial(ignition::gazebo::EntityComponentManager &_ecm,
+                       const sdf::Material &_material);
 
 public:
     transport::Node node;
-    //model
     Model model{kNullEntity};
-    std::unique_ptr<SdfEntityCreator> creator { nullptr };
     sdf::Model modelSdf;
     std::vector<std::string> linkVisuals;
     std::vector<VisualEntityInfo> visualEntityInfos;
     bool isInit{false};
-    bool isDone{true};
-    // cmd
     // 0:no light, 1:red light, 2:blue light, 3:yellow light, 4:white light
-    int targetState;
+    int targetState{0};
     bool change{false};
     std::mutex targetMutex;
 };
@@ -112,7 +101,7 @@ LightBarController::LightBarController() : dataPtr(std::make_unique<LightBarCont
 void LightBarController::Configure(const Entity &_entity,
                              const std::shared_ptr<const sdf::Element> &_sdf,
                              EntityComponentManager &_ecm,
-                             EventManager & _eventMgr)
+                             EventManager &)
 {
     this->dataPtr->model = Model(_entity);
     if (!this->dataPtr->model.Valid(_ecm))
@@ -147,8 +136,6 @@ void LightBarController::Configure(const Entity &_entity,
         this->dataPtr->linkVisuals.push_back(std::move(path));
         sdfElem = sdfElem->GetNextElement("link_visual");
     }
-    // creator
-    this->dataPtr->creator = std::make_unique<SdfEntityCreator>(_ecm, _eventMgr);
     // Model Sdf
     this->dataPtr->modelSdf = _ecm.Component<components::ModelSdf>(_entity)->Data();
     // Subscribe to commands
@@ -169,28 +156,11 @@ void LightBarController::PreUpdate(const ignition::gazebo::UpdateInfo &_info,
     }
     {
         std::lock_guard<std::mutex> lock(this->dataPtr->targetMutex);
-        //
-        if(this->dataPtr->isDone && this->dataPtr->change){
+        if(this->dataPtr->change){
             auto targetMaterial = GetMaterial(this->dataPtr->targetState);
-            for(auto &info: this->dataPtr->visualEntityInfos){
-                info.state = 0;
-                info.visualSdf.SetMaterial(targetMaterial);
-            }
-            this->dataPtr->change = false; 
-            this->dataPtr->isDone = false;
+            this->dataPtr->ApplyMaterial(_ecm, targetMaterial);
+            this->dataPtr->change = false;
         }
-    }
-    if(!this->dataPtr->isDone){
-        this->dataPtr->UpdateVisualEnitiies();
-        // check
-        bool flag = true;
-        for(auto &info: this->dataPtr->visualEntityInfos){
-            if(info.state<2){
-                flag = false;
-                break;
-            }
-        }
-        this->dataPtr->isDone = flag;
     }
 }
 
@@ -204,36 +174,37 @@ void LightBarControllerPrivate::OnCmd(const ignition::msgs::Int32 &_msg)
 }
 
 void LightBarControllerPrivate::Init(ignition::gazebo::EntityComponentManager &_ecm){
-    bool flag = false;
-    for(auto linkVisual : this->linkVisuals){
-        flag = false;
+    for(const auto &linkVisual : this->linkVisuals){
         auto v = common::split(linkVisual,"/");
         if(v.size() == 2){
             auto link = this->model.LinkByName(_ecm, v[0]);
-            auto visual = _ecm.EntityByComponents(components::ParentEntity(link),components::Name(v[1]),components::Visual());
+            auto visual = _ecm.EntityByComponents(
+                components::ParentEntity(link),
+                components::Name(v[1]),
+                components::Visual());
             if(visual != kNullEntity){
-                sdf::Visual visualSdf = *(this->modelSdf.LinkByName(v[0])->VisualByName(v[1]));
-                this->visualEntityInfos.emplace_back(visual,link,visualSdf,2);
-                flag = true;
+                this->visualEntityInfos.emplace_back(visual);
+                continue;
             }
         }
-        if(!flag){
-            ignerr << "LightBarController: visual element of link [" << linkVisual << "] is invaild" << std::endl;
-        }
+        ignerr << "LightBarController: visual element of link ["
+               << linkVisual << "] is invalid" << std::endl;
     }
 }
 
-void LightBarControllerPrivate::UpdateVisualEnitiies(){
-    for(auto &info: this->visualEntityInfos){
-        if(info.state == 0){
-            this->creator->RequestRemoveEntity(info.entity);
-        }else if(info.state == 1){
-            info.entity = this->creator->CreateEntities(&(info.visualSdf));
-            this->creator->SetParent(info.entity , info.parentEntity);
+void LightBarControllerPrivate::ApplyMaterial(
+    ignition::gazebo::EntityComponentManager &_ecm,
+    const sdf::Material &_material)
+{
+    for(auto &info : this->visualEntityInfos){
+        auto materialComp = _ecm.Component<components::Material>(info.entity);
+        if(materialComp){
+            *materialComp = components::Material(_material);
+            _ecm.SetChanged(info.entity, components::Material::typeId,
+                            ComponentState::OneTimeChange);
+        }else{
+            _ecm.CreateComponent(info.entity, components::Material(_material));
         }
-        if(info.state<2){
-            info.state++;
-        }  
     }
 }
 
