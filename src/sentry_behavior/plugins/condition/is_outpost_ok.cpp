@@ -16,28 +16,10 @@ BT::NodeStatus IsOutpostOkCondition::checkOutpost()
     RCLCPP_ERROR(logger_, "Outpost message is not available");
     return BT::NodeStatus::FAILURE;
   }
-  bool team_colour = msg->team_colour;
-  if(team_colour==0){
-    if(msg->red_outpost_hp>0){
-      return BT::NodeStatus::SUCCESS;
-    }
-    else if(msg->blue_outpost_hp==0){
-      return BT::NodeStatus::FAILURE;
-    }
-  }
-  else if(team_colour==1){
-    if(msg->blue_outpost_hp>0){
-      return BT::NodeStatus::SUCCESS;
-    }
-    else if(msg->red_outpost_hp==0){
-      return BT::NodeStatus::FAILURE;
-    }
-    
-  }
-  else{
-    return BT::NodeStatus::FAILURE;
-  }
 
+  if (msg->ally_outpost_hp > 0) {
+    return BT::NodeStatus::SUCCESS;
+  }
   return BT::NodeStatus::FAILURE;
 }
 
