@@ -65,6 +65,11 @@ class SharedData:
             '基地': 0,
         }
 
+        self.cmd_count = 0
+        self.latest_vx = 0.0
+        self.latest_vy = 0.0
+        self.latest_vw = 0.0
+
         self.last_rx = {
             'gimbal': 0.0,
             'cmd_vel': 0.0,
@@ -102,6 +107,10 @@ class SerialVisualizerNode(Node):
             self.shared.cmd_vx.append(float(msg.linear.x))
             self.shared.cmd_vy.append(float(msg.linear.y))
             self.shared.cmd_vw.append(float(msg.angular.z))
+            self.shared.latest_vx = float(msg.linear.x)
+            self.shared.latest_vy = float(msg.linear.y)
+            self.shared.latest_vw = float(msg.angular.z)
+            self.shared.cmd_count += 1
             self.shared.last_rx['cmd_vel'] = now
 
     def _on_game_status(self, msg: GameStatus) -> None:
@@ -281,6 +290,34 @@ class MainWindow(QtWidgets.QMainWindow):
         robot_layout.addWidget(self.hp_bar)
         robot_layout.addWidget(self.ammo_label)
 
+        tx_box = DashboardPanel('发送数据 (ROS→电控)')
+        tx_layout = QtWidgets.QGridLayout(tx_box)
+        tx_layout.setSpacing(6)
+
+        vel_labels = [('vel_x', 'm/s'), ('vel_y', 'm/s'), ('vel_w', 'rad/s')]
+        self.tx_value_labels = {}
+        for i, (name, unit) in enumerate(vel_labels):
+            name_lbl = QtWidgets.QLabel(f'{name}:')
+            name_lbl.setStyleSheet('font-size: 14px; font-weight: 600;')
+            val_lbl = QtWidgets.QLabel('0.000')
+            val_lbl.setStyleSheet('font-size: 20px; font-weight: 800; color: #f8fafc; font-family: monospace;')
+            unit_lbl = QtWidgets.QLabel(unit)
+            unit_lbl.setStyleSheet('font-size: 12px; color: #94a3b8;')
+            tx_layout.addWidget(name_lbl, i, 0)
+            tx_layout.addWidget(val_lbl, i, 1)
+            tx_layout.addWidget(unit_lbl, i, 2)
+            self.tx_value_labels[name] = val_lbl
+
+        self.tx_freq_label = QtWidgets.QLabel('频率: — Hz')
+        self.tx_freq_label.setStyleSheet('font-size: 13px; color: #7dd3fc;')
+        self.tx_count_label = QtWidgets.QLabel('计数: 0')
+        self.tx_count_label.setStyleSheet('font-size: 13px; color: #94a3b8;')
+        tx_footer = QtWidgets.QHBoxLayout()
+        tx_footer.addWidget(self.tx_freq_label)
+        tx_footer.addStretch(1)
+        tx_footer.addWidget(self.tx_count_label)
+        tx_layout.addLayout(tx_footer, len(vel_labels), 0, 1, 3)
+
         team_box = DashboardPanel('全队血量')
         team_layout = QtWidgets.QVBoxLayout(team_box)
         team_layout.setSpacing(6)
@@ -317,6 +354,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_layout.addWidget(game_box)
         right_layout.addWidget(robot_box)
+        right_layout.addWidget(tx_box)
         right_layout.addWidget(team_box, stretch=1)
 
         body_layout.addWidget(left_widget, stretch=3)
@@ -370,6 +408,11 @@ class MainWindow(QtWidgets.QMainWindow):
             cmd_vy = list(self.shared.cmd_vy)
             cmd_vw = list(self.shared.cmd_vw)
 
+            latest_vx = self.shared.latest_vx
+            latest_vy = self.shared.latest_vy
+            latest_vw = self.shared.latest_vw
+            cmd_count = self.shared.cmd_count
+
             game_progress = self.shared.game_progress
             stage_remain_time = self.shared.stage_remain_time
             current_hp = self.shared.current_hp
@@ -421,6 +464,24 @@ class MainWindow(QtWidgets.QMainWindow):
             value = min(value, bar.maximum())
             bar.setValue(value)
             value_label.setText(str(value))
+
+        self.tx_value_labels['vel_x'].setText(f'{latest_vx:+.3f}')
+        self.tx_value_labels['vel_y'].setText(f'{latest_vy:+.3f}')
+        self.tx_value_labels['vel_w'].setText(f'{latest_vw:+.3f}')
+        self.tx_count_label.setText(f'计数: {cmd_count}')
+
+        cmd_hz = 0.0
+        cutoff = now - 2.0
+        recent_cmd = sum(1 for t in cmd_t if t >= cutoff)
+        cmd_hz = recent_cmd / 2.0
+        self.tx_freq_label.setText(f'频率: {cmd_hz:.1f} Hz')
+
+        for name, lbl in self.tx_value_labels.items():
+            val = latest_vx if name == 'vel_x' else (latest_vy if name == 'vel_y' else latest_vw)
+            if abs(val) > 0.01:
+                lbl.setStyleSheet('font-size: 20px; font-weight: 800; color: #4f8cff; font-family: monospace;')
+            else:
+                lbl.setStyleSheet('font-size: 20px; font-weight: 800; color: #f8fafc; font-family: monospace;')
 
         active_s = 1.0
         def mark(topic_key: str) -> str:
