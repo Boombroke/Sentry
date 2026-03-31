@@ -34,7 +34,7 @@ src/
 ├── rm_interfaces/               # RoboMaster自定义消息接口
 ├── auto_aim_interfaces/         # 自动瞄准接口
 ├── serial/                      # 串口通信驱动
-├── location/                    # 地图可视化工具
+├── sentry_tools/                # 开发调试工具集（串口Mock/地图坐标拾取/数据可视化）
 ├── odom_interpolator/           # 里程计插值
 ├── small_gicp_relocalization/   # 基于small_gicp的重定位
 ├── BehaviorTree.ROS2/           # 行为树ROS2集成
@@ -106,6 +106,28 @@ ros2 launch sentry_nav_bringup rm_navigation_reality_launch.py world:=<WORLD_NAM
 | params_file | 导航参数配置文件路径 | "" |
 | use_rviz | 是否启动 RViz 可视化 | true |
 | use_robot_state_pub | 是否发布机器人状态 | true |
+
+## 开发调试工具
+
+项目内置了一套独立的调试工具集（`src/sentry_tools/`），无需启动完整 ROS 节点即可进行协议联调和导航配置。
+
+### 工具箱（串口 Mock + 地图坐标拾取）
+```bash
+python3 src/sentry_tools/sentry_toolbox.py
+```
+- **串口 Mock**：模拟电控发送 IMU/状态/血量三类协议包，接收并显示 ROS 下发的速度指令
+- **地图坐标拾取**：加载 `.yaml + .pgm` 地图，鼠标拾取导航目标点坐标，支持复制到剪贴板
+
+### 串口数据可视化（需 ROS 环境）
+```bash
+source install/setup.bash
+python3 src/sentry_tools/serial_visualizer.py
+```
+- 实时滚动曲线：云台 pitch/yaw、导航速度 vx/vy/vw
+- 仪表盘：比赛阶段、HP 进度条、弹量、全队血量柱状图
+- 暗色主题，类似轻量版 Foxglove
+
+详见 [sentry_tools 使用文档](src/sentry_tools/README.md)。
 
 ## 许可证
 本项目采用 Apache-2.0 许可证。
