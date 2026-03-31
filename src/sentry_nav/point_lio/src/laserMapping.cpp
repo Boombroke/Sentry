@@ -275,6 +275,17 @@ void publish_odometry(
   }
   set_posestamp(odomAftMapped.pose.pose);
 
+  // Populate twist with EKF-fused velocity (in camera_init/world frame)
+  if (use_imu_as_input) {
+    odomAftMapped.twist.twist.linear.x = kf_input.x_.vel(0);
+    odomAftMapped.twist.twist.linear.y = kf_input.x_.vel(1);
+    odomAftMapped.twist.twist.linear.z = kf_input.x_.vel(2);
+  } else {
+    odomAftMapped.twist.twist.linear.x = kf_output.x_.vel(0);
+    odomAftMapped.twist.twist.linear.y = kf_output.x_.vel(1);
+    odomAftMapped.twist.twist.linear.z = kf_output.x_.vel(2);
+  }
+
   pubOdomAftMapped->publish(odomAftMapped);
 
   if (tf_send_en) {

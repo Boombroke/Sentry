@@ -4,6 +4,8 @@ log/
 AGENTS.md
 MEMORY.md
 .cache/
+__pycache__/
+*.pyc
 
 # 大文件（点云、地图、3D 模型等）
 *.pcd
