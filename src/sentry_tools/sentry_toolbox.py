@@ -5,6 +5,9 @@ import os
 import pathlib
 import sys
 import threading
+import collections
+import struct
+import time
 from glob import glob
 import re
 import subprocess
@@ -163,6 +166,228 @@ class SerialReaderThread(QtCore.QThread):
             pkt, crc_ok = result
             if isinstance(pkt, NavPacket) and NavPacket in ROS_TO_STM32_PACKETS and NavPacket.HEADER in PACKETS:
                 self.nav_packet_received.emit(pkt.vel_x, pkt.vel_y, pkt.vel_w, crc_ok)
+
+
+class DiagReaderThread(QtCore.QThread):
+    stats_updated = QtCore.pyqtSignal(dict)
+    serial_error = QtCore.pyqtSignal(str)
+    BUFFER_OVERFLOW_THRESHOLD = 4096
+    CONTENT_JUMP_THRESHOLD = 1.0
+    SYNC_TIMEOUT_SEC = 0.2
+
+    def __init__(
+        self,
+        serial_obj: serial.Serial,
+        serial_lock: threading.Lock,
+        headers: list[int],
+    ) -> None:
+        super().__init__()
+        self._serial = serial_obj
+        self._serial_lock = serial_lock
+        self._headers = headers
+        self._running = True
+        self._buffer = bytearray()
+        self._stats_lock = threading.Lock()
+        self._emit_interval = 0.5
+        self._reset_internal()
+
+    def _reset_internal(self) -> None:
+        now = time.monotonic()
+        self._pkt_ok = {hdr: 0 for hdr in self._headers}
+        self._pkt_crc_err = {hdr: 0 for hdr in self._headers}
+        self._pkt_times = {hdr: collections.deque(maxlen=200) for hdr in self._headers}
+        self._total_bytes = 0
+        self._waste_bytes = 0
+        self._start_time = now
+        self._last_emit = now
+        self._last_emit_bytes = 0
+        self._sync_failures = 0
+        self._buffer_overflow_events = 0
+        self._consecutive_crc_errors = 0
+        self._max_consecutive_crc_errors = 0
+        self._invalid_header_total = 0
+        self._invalid_header_times = collections.deque(maxlen=1000)
+        self._last_valid_packet_time = None
+        self._max_no_packet_gap = 0.0
+        self._byte_rate_history = collections.deque(maxlen=60)
+        self._byte_rate_sudden_changes = 0
+        self._content_jumps = 0
+        self._last_imu_pitch = None
+        self._last_imu_yaw = None
+        self._pending_hdr = None
+        self._pending_since = None
+
+    def stop(self) -> None:
+        self._running = False
+
+    def reset_stats(self) -> None:
+        with self._stats_lock:
+            self._buffer.clear()
+            self._reset_internal()
+
+    def run(self) -> None:
+        while self._running:
+            try:
+                with self._serial_lock:
+                    if self._serial and self._serial.is_open:
+                        chunk = self._serial.read(512)
+                    else:
+                        break
+                now = time.monotonic()
+                if chunk:
+                    with self._stats_lock:
+                        self._total_bytes += len(chunk)
+                        self._buffer.extend(chunk)
+                        if len(self._buffer) > self.BUFFER_OVERFLOW_THRESHOLD:
+                            self._buffer_overflow_events += 1
+                            self._buffer = self._buffer[-self.BUFFER_OVERFLOW_THRESHOLD:]
+                        self._parse_buffer_locked()
+                else:
+                    self.msleep(5)
+
+                if now - self._last_emit >= self._emit_interval:
+                    with self._stats_lock:
+                        stats = self._build_stats_locked(now)
+                        self._last_emit = now
+                    self.stats_updated.emit(stats)
+            except Exception as exc:
+                self.serial_error.emit(f'诊断读取错误: {exc}')
+                self.msleep(30)
+
+    def _parse_buffer_locked(self) -> None:
+        while len(self._buffer) >= 3:
+            now = time.monotonic()
+            hdr = self._buffer[0]
+            pkt_size = packet_size_for_header(hdr)
+            if pkt_size == 0 or hdr not in self._pkt_ok:
+                self._invalid_header_total += 1
+                self._invalid_header_times.append(now)
+                self._waste_bytes += 1
+                del self._buffer[0]
+                continue
+            if len(self._buffer) < pkt_size:
+                if self._pending_hdr != hdr:
+                    self._pending_hdr = hdr
+                    self._pending_since = now
+                elif self._pending_since is not None and (now - self._pending_since) > self.SYNC_TIMEOUT_SEC:
+                    self._sync_failures += 1
+                    self._waste_bytes += 1
+                    del self._buffer[0]
+                    self._pending_hdr = None
+                    self._pending_since = None
+                    continue
+                break
+            self._pending_hdr = None
+            self._pending_since = None
+
+            raw = bytes(self._buffer[:pkt_size])
+            del self._buffer[:pkt_size]
+            body = raw[:pkt_size - 2]
+            recv_crc = struct.unpack('<H', raw[pkt_size - 2:pkt_size])[0]
+            if crc16(body) == recv_crc:
+                self._pkt_ok[hdr] += 1
+                self._pkt_times[hdr].append(now)
+                self._consecutive_crc_errors = 0
+                if self._last_valid_packet_time is not None:
+                    gap = now - self._last_valid_packet_time
+                    if gap > self._max_no_packet_gap:
+                        self._max_no_packet_gap = gap
+                self._last_valid_packet_time = now
+                if hdr == 0xA1 and len(body) == 9:
+                    _, pitch, yaw = struct.unpack('<Bff', body)
+                    if self._last_imu_pitch is not None and self._last_imu_yaw is not None:
+                        if (
+                            abs(pitch - self._last_imu_pitch) > self.CONTENT_JUMP_THRESHOLD
+                            or abs(yaw - self._last_imu_yaw) > self.CONTENT_JUMP_THRESHOLD
+                        ):
+                            self._content_jumps += 1
+                    self._last_imu_pitch = pitch
+                    self._last_imu_yaw = yaw
+            else:
+                self._pkt_crc_err[hdr] += 1
+                self._consecutive_crc_errors += 1
+                if self._consecutive_crc_errors > self._max_consecutive_crc_errors:
+                    self._max_consecutive_crc_errors = self._consecutive_crc_errors
+
+    def _build_stats_locked(self, now: float) -> dict:
+        elapsed = max(1e-6, now - self._start_time)
+        packets: dict[int, dict] = {}
+
+        total_ok = 0
+        total_crc_err = 0
+        for hdr in self._headers:
+            ok = self._pkt_ok.get(hdr, 0)
+            crc_err = self._pkt_crc_err.get(hdr, 0)
+            total_ok += ok
+            total_crc_err += crc_err
+
+            times = list(self._pkt_times.get(hdr, []))
+            rate_hz = 0.0
+            interval_avg_ms = 0.0
+            interval_min_ms = 0.0
+            interval_max_ms = 0.0
+            jitter_std_ms = 0.0
+            if times:
+                cutoff = now - 2.0
+                recent = sum(1 for ts in times if ts >= cutoff)
+                rate_hz = recent / 2.0
+            if len(times) >= 2:
+                intervals = [times[i] - times[i - 1] for i in range(1, len(times))]
+                interval_avg_ms = sum(intervals) / len(intervals) * 1000.0
+                interval_min_ms = min(intervals) * 1000.0
+                interval_max_ms = max(intervals) * 1000.0
+                jitter_std_ms = (
+                    sum((interval * 1000.0 - interval_avg_ms) ** 2 for interval in intervals) / len(intervals)
+                ) ** 0.5
+
+            packets[hdr] = {
+                'ok': ok,
+                'crc_err': crc_err,
+                'rate_hz': rate_hz,
+                'interval_avg_ms': interval_avg_ms,
+                'interval_min_ms': interval_min_ms,
+                'interval_max_ms': interval_max_ms,
+                'jitter_std_ms': jitter_std_ms,
+            }
+
+        total_attempts = total_ok + total_crc_err
+        loss_rate = total_crc_err / total_attempts if total_attempts > 0 else 0.0
+        waste_rate = self._waste_bytes / self._total_bytes if self._total_bytes > 0 else 0.0
+        emit_dt = max(0.001, now - self._last_emit)
+        emit_bytes = max(0, self._total_bytes - self._last_emit_bytes)
+        instant_bps = emit_bytes / emit_dt
+        self._byte_rate_history.append(instant_bps)
+        if len(self._byte_rate_history) >= 4:
+            recent_avg = sum(self._byte_rate_history) / len(self._byte_rate_history)
+            latest = self._byte_rate_history[-1]
+            if recent_avg > 0 and (latest < recent_avg * 0.1 or latest > recent_avg * 3.0):
+                self._byte_rate_sudden_changes += 1
+        self._last_emit_bytes = self._total_bytes
+        invalid_header_per_sec = sum(1 for ts in self._invalid_header_times if ts >= now - 1.0)
+        max_gap = self._max_no_packet_gap
+        if self._last_valid_packet_time is not None:
+            max_gap = max(max_gap, now - self._last_valid_packet_time)
+
+        return {
+            'total_bytes': self._total_bytes,
+            'waste_bytes': self._waste_bytes,
+            'elapsed': elapsed,
+            'throughput_bps': self._total_bytes / elapsed,
+            'packets': packets,
+            'total_ok': total_ok,
+            'total_crc_err': total_crc_err,
+            'loss_rate': loss_rate,
+            'waste_rate': waste_rate,
+            'sync_failures': self._sync_failures,
+            'buffer_overflow_events': self._buffer_overflow_events,
+            'consecutive_crc_errors': self._consecutive_crc_errors,
+            'max_consecutive_crc_errors': self._max_consecutive_crc_errors,
+            'invalid_header_total': self._invalid_header_total,
+            'invalid_header_per_sec': float(invalid_header_per_sec),
+            'max_no_packet_gap_ms': max_gap * 1000.0,
+            'byte_rate_sudden_changes': self._byte_rate_sudden_changes,
+            'content_jumps': self._content_jumps,
+        }
 
 
 class SerialMockTab(QtWidgets.QWidget):
@@ -954,6 +1179,664 @@ class CollapsibleSection(QtWidgets.QWidget):
             self.summary_label.setText(f'<span style="color: #34d399;">{total}/{total} ✅</span>')
 
 
+class SerialDiagTab(QtWidgets.QWidget):
+    LOSS_GOOD = '#34d399'
+    LOSS_WARN = '#fbbf24'
+    LOSS_BAD = '#ef4444'
+    STATUS_GOOD = '#34d399'
+    STATUS_WARN = '#fbbf24'
+    STATUS_BAD = '#ef4444'
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.serial_port: serial.Serial | None = None
+        self.serial_lock = threading.Lock()
+        self.reader_thread: DiagReaderThread | None = None
+        self.ui_timer = QtCore.QTimer(self)
+        self.ui_timer.setInterval(500)
+        self.ui_timer.timeout.connect(self._refresh_ui)
+        self.latest_stats: dict | None = None
+
+        self.packet_classes = [
+            pkt_class for pkt_class in STM32_TO_ROS_PACKETS if pkt_class.HEADER in PACKETS
+        ]
+        self.packet_headers = [pkt_class.HEADER for pkt_class in self.packet_classes]
+        self.packet_names = {
+            pkt_class.HEADER: pkt_class.__name__.replace('Packet', '') for pkt_class in self.packet_classes
+        }
+        self.expected_interval_ms = {
+            pkt_class.HEADER: (1000.0 / pkt_class.FREQUENCY_HZ) if pkt_class.FREQUENCY_HZ > 0 else None
+            for pkt_class in self.packet_classes
+        }
+        self.rate_history = {
+            pkt_class.HEADER: collections.deque(maxlen=120) for pkt_class in self.packet_classes
+        }
+
+        self._packet_rows: dict[int, dict[str, QtWidgets.QLabel]] = {}
+        self._interval_rows: dict[int, dict[str, QtWidgets.QLabel]] = {}
+        self._advanced_rows: dict[str, dict[str, QtWidgets.QLabel]] = {}
+        self._alert_items: list[QtWidgets.QFrame] = []
+        self._build_ui()
+        self.refresh_ports()
+        self._set_connection_state(False)
+        self._refresh_ui(force_zero=True)
+
+    def _build_ui(self) -> None:
+        main_layout = QtWidgets.QVBoxLayout(self)
+
+        top_bar = QtWidgets.QHBoxLayout()
+        self.port_combo = QtWidgets.QComboBox()
+        self.port_combo.setMinimumWidth(180)
+        self.refresh_port_button = QtWidgets.QPushButton('Refresh')
+
+        self.baud_combo = QtWidgets.QComboBox()
+        for b in ['9600', '115200', '460800', '921600']:
+            self.baud_combo.addItem(b)
+        self.baud_combo.setCurrentText('115200')
+
+        self.connect_button = QtWidgets.QPushButton('Connect')
+        self.disconnect_button = QtWidgets.QPushButton('Disconnect')
+        self.reset_button = QtWidgets.QPushButton('重置统计')
+        self.conn_indicator = QtWidgets.QLabel('● 未连接')
+        self.conn_indicator.setMinimumWidth(140)
+
+        top_bar.addWidget(QtWidgets.QLabel('串口'))
+        top_bar.addWidget(self.port_combo)
+        top_bar.addWidget(self.refresh_port_button)
+        top_bar.addSpacing(12)
+        top_bar.addWidget(QtWidgets.QLabel('波特率'))
+        top_bar.addWidget(self.baud_combo)
+        top_bar.addSpacing(12)
+        top_bar.addWidget(self.connect_button)
+        top_bar.addWidget(self.disconnect_button)
+        top_bar.addWidget(self.reset_button)
+        top_bar.addStretch(1)
+        top_bar.addWidget(QtWidgets.QLabel('状态:'))
+        top_bar.addWidget(self.conn_indicator)
+        main_layout.addLayout(top_bar)
+
+        self.hint_stack = QtWidgets.QStackedLayout()
+
+        hint_widget = QtWidgets.QWidget()
+        hint_layout = QtWidgets.QVBoxLayout(hint_widget)
+        hint_layout.addStretch(1)
+        hint_label = QtWidgets.QLabel('请连接真实串口设备开始诊断')
+        hint_label.setAlignment(QtCore.Qt.AlignCenter)
+        hint_label.setStyleSheet('color: #94a3b8; font-size: 16px; font-weight: 600;')
+        hint_layout.addWidget(hint_label)
+        hint_layout.addStretch(1)
+        self.hint_stack.addWidget(hint_widget)
+
+        content_widget = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content_widget)
+        content_layout.setSpacing(10)
+
+        self.alert_section = CollapsibleSection('智能告警', self)
+        self._build_alerts(self.alert_section.content_layout)
+        content_layout.addWidget(self.alert_section)
+
+        self.overview_section = CollapsibleSection('链路总览', self)
+        self._build_overview(self.overview_section.content_layout)
+        content_layout.addWidget(self.overview_section)
+
+        self.packet_section = CollapsibleSection('各包类型统计', self)
+        self._build_packet_table(self.packet_section.content_layout)
+        content_layout.addWidget(self.packet_section)
+
+        self.interval_section = CollapsibleSection('包间隔分析', self)
+        self._build_interval_table(self.interval_section.content_layout)
+        content_layout.addWidget(self.interval_section)
+
+        self.advanced_section = CollapsibleSection('高级诊断', self)
+        self._build_advanced_table(self.advanced_section.content_layout)
+        content_layout.addWidget(self.advanced_section)
+
+        self.plot_section = CollapsibleSection('实时速率曲线', self)
+        self._build_plot(self.plot_section.content_layout)
+        content_layout.addWidget(self.plot_section, stretch=1)
+        content_layout.addStretch(1)
+
+        self._set_section_expanded(self.alert_section, True)
+        self._set_section_expanded(self.overview_section, True)
+        self._set_section_expanded(self.packet_section, True)
+        self._set_section_expanded(self.interval_section, False)
+        self._set_section_expanded(self.advanced_section, False)
+        self._set_section_expanded(self.plot_section, True)
+
+        self.hint_stack.addWidget(content_widget)
+        main_layout.addLayout(self.hint_stack, stretch=1)
+
+        self.refresh_port_button.clicked.connect(self.refresh_ports)
+        self.connect_button.clicked.connect(self.connect_serial)
+        self.disconnect_button.clicked.connect(self.disconnect_serial)
+        self.reset_button.clicked.connect(self.reset_stats)
+
+    def _set_section_expanded(self, section: CollapsibleSection, expanded: bool) -> None:
+        section.is_expanded = expanded
+        section.content_area.setVisible(expanded)
+        section.arrow_label.setText('▼' if expanded else '▶')
+
+    def _build_alerts(self, layout: QtWidgets.QGridLayout) -> None:
+        self.alert_container = QtWidgets.QWidget()
+        self.alert_layout = QtWidgets.QVBoxLayout(self.alert_container)
+        self.alert_layout.setContentsMargins(0, 0, 0, 0)
+        self.alert_layout.setSpacing(8)
+        layout.addWidget(self.alert_container, 0, 0)
+
+    def _build_advanced_table(self, layout: QtWidgets.QGridLayout) -> None:
+        headers = ['指标', '值', '状态']
+        for col, name in enumerate(headers):
+            label = QtWidgets.QLabel(name)
+            label.setStyleSheet('color: #94a3b8; font-weight: 600;')
+            layout.addWidget(label, 0, col)
+
+        rows = [
+            ('sync_failures', '帧同步失败'),
+            ('buffer_overflow_events', '缓冲区溢出'),
+            ('max_consecutive_crc_errors', '连续CRC错误峰值'),
+            ('invalid_header_per_sec', 'Invalid Header 速率'),
+            ('max_no_packet_gap_ms', '最长无包间隔'),
+            ('byte_rate_sudden_changes', '字节率突变'),
+            ('content_jumps', '内容跳变'),
+        ]
+
+        for row, (key, name) in enumerate(rows, start=1):
+            name_label = QtWidgets.QLabel(name)
+            value_label = QtWidgets.QLabel('--')
+            status_label = QtWidgets.QLabel('✅ 正常')
+            layout.addWidget(name_label, row, 0)
+            layout.addWidget(value_label, row, 1)
+            layout.addWidget(status_label, row, 2)
+            self._advanced_rows[key] = {
+                'value': value_label,
+                'status': status_label,
+            }
+
+    def _update_advanced_table(self, stats: dict | None) -> None:
+        values = {
+            'sync_failures': int((stats or {}).get('sync_failures', 0)),
+            'buffer_overflow_events': int((stats or {}).get('buffer_overflow_events', 0)),
+            'max_consecutive_crc_errors': int((stats or {}).get('max_consecutive_crc_errors', 0)),
+            'invalid_header_per_sec': float((stats or {}).get('invalid_header_per_sec', 0.0)),
+            'max_no_packet_gap_ms': float((stats or {}).get('max_no_packet_gap_ms', 0.0)),
+            'byte_rate_sudden_changes': int((stats or {}).get('byte_rate_sudden_changes', 0)),
+            'content_jumps': int((stats or {}).get('content_jumps', 0)),
+        }
+
+        self._set_adv_row('sync_failures', f"{values['sync_failures']} 次", self._status_for(values['sync_failures'] > 0, False))
+        self._set_adv_row('buffer_overflow_events', f"{values['buffer_overflow_events']} 次", self._status_for(values['buffer_overflow_events'] > 0, False))
+
+        crc_peak = values['max_consecutive_crc_errors']
+        self._set_adv_row(
+            'max_consecutive_crc_errors',
+            f'{crc_peak}',
+            self._status_for(crc_peak > 2, crc_peak > 5),
+        )
+
+        invalid_rate = values['invalid_header_per_sec']
+        self._set_adv_row(
+            'invalid_header_per_sec',
+            f'{invalid_rate:.1f}/s',
+            self._status_for(invalid_rate > 10.0, invalid_rate > 30.0),
+        )
+
+        gap_ms = values['max_no_packet_gap_ms']
+        self._set_adv_row(
+            'max_no_packet_gap_ms',
+            f'{gap_ms:.0f} ms',
+            self._status_for(gap_ms > 500.0, gap_ms > 2000.0),
+        )
+
+        sudden = values['byte_rate_sudden_changes']
+        self._set_adv_row('byte_rate_sudden_changes', f'{sudden} 次', self._status_for(sudden > 0, sudden > 10))
+
+        jumps = values['content_jumps']
+        self._set_adv_row('content_jumps', f'{jumps} 次', self._status_for(jumps > 0, False))
+
+    def _status_for(self, warn: bool, error: bool) -> tuple[str, str]:
+        if error:
+            return '❌ 异常', self.STATUS_BAD
+        if warn:
+            return '⚠️ 警告', self.STATUS_WARN
+        return '✅ 正常', self.STATUS_GOOD
+
+    def _set_adv_row(self, key: str, value_text: str, status: tuple[str, str]) -> None:
+        row = self._advanced_rows[key]
+        status_text, color = status
+        row['value'].setText(value_text)
+        row['value'].setStyleSheet(f'color: {color}; font-weight: 600;')
+        row['status'].setText(status_text)
+        row['status'].setStyleSheet(f'color: {color}; font-weight: 600;')
+
+    def _compute_alerts(self, stats: dict) -> list[dict[str, str]]:
+        alerts = []
+
+        invalid_rate = stats.get('invalid_header_per_sec', 0)
+        total_ok = stats.get('total_ok', 0)
+        total_crc_err = stats.get('total_crc_err', 0)
+        elapsed = stats.get('elapsed', 0)
+        if elapsed > 2.0 and total_ok == 0 and (invalid_rate > 10 or total_crc_err > 10):
+            alerts.append({
+                'level': 'error',
+                'title': '疑似波特率不匹配',
+                'detail': f'运行 {elapsed:.0f}s 无有效包，废字节率极高。请检查两端波特率是否一致。',
+            })
+
+        if elapsed > 5.0 and total_ok == 0 and stats.get('total_bytes', 0) > 1000:
+            alerts.append({
+                'level': 'error',
+                'title': '疑似协议不匹配',
+                'detail': '收到大量数据但无法解析任何有效包。请确认电控端协议版本。',
+            })
+
+        loss = stats.get('loss_rate', 0)
+        if loss > 0.05 and (total_ok + total_crc_err) > 20:
+            alerts.append({
+                'level': 'error',
+                'title': f'CRC 错误率过高: {loss:.1%}',
+                'detail': '线路噪声严重或数据线接触不良。检查 USB 线缆和接口。',
+            })
+        elif loss > 0.01 and (total_ok + total_crc_err) > 50:
+            alerts.append({
+                'level': 'warn',
+                'title': f'CRC 错误率偏高: {loss:.1%}',
+                'detail': '存在少量传输错误，建议更换线缆或降低波特率。',
+            })
+
+        max_consec = stats.get('max_consecutive_crc_errors', 0)
+        if max_consec >= 5:
+            alerts.append({
+                'level': 'error',
+                'title': f'连续 {max_consec} 个包 CRC 错误',
+                'detail': '可能是协议结构体不对齐，或电控端发送了错误格式的数据。',
+            })
+
+        gap = stats.get('max_no_packet_gap_ms', 0)
+        if gap > 2000:
+            alerts.append({
+                'level': 'error',
+                'title': f'最长无包间隔: {gap:.0f}ms',
+                'detail': '串口可能曾断连或电控端死机重启。',
+            })
+        elif gap > 500:
+            alerts.append({
+                'level': 'warn',
+                'title': f'最长无包间隔: {gap:.0f}ms',
+                'detail': '间隔偏长，可能有瞬时卡顿。',
+            })
+
+        overflow = stats.get('buffer_overflow_events', 0)
+        if overflow > 0:
+            alerts.append({
+                'level': 'warn',
+                'title': f'缓冲区溢出 {overflow} 次',
+                'detail': '上位机处理速度跟不上数据到达速率，检查 CPU 负载。',
+            })
+
+        jumps = stats.get('content_jumps', 0)
+        if jumps > 5:
+            alerts.append({
+                'level': 'warn',
+                'title': f'IMU 数据跳变 {jumps} 次',
+                'detail': 'pitch/yaw 出现大幅突变 (>1rad)，可能中间丢了包或 IMU 数据异常。',
+            })
+
+        if not alerts and elapsed > 3.0 and total_ok > 10:
+            alerts.append({
+                'level': 'ok',
+                'title': '链路正常',
+                'detail': f'已稳定运行 {elapsed:.0f}s，无异常。',
+            })
+
+        return alerts
+
+    def _clear_vlayout(self, layout: QtWidgets.QVBoxLayout) -> None:
+        while layout.count() > 0:
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _update_alerts(self, stats: dict | None) -> None:
+        self._clear_vlayout(self.alert_layout)
+        if stats is None:
+            placeholder = QtWidgets.QLabel('等待串口数据...')
+            placeholder.setStyleSheet('color: #94a3b8; padding: 4px 2px;')
+            self.alert_layout.addWidget(placeholder)
+            self.alert_layout.addStretch(1)
+            return
+
+        alerts = self._compute_alerts(stats)
+        level_style = {
+            'error': ('#2d1215', '#ef4444', '#ef4444', '❌'),
+            'warn': ('#2d2815', '#fbbf24', '#fbbf24', '⚠️'),
+            'ok': ('#0d2818', '#34d399', '#34d399', '✅'),
+        }
+
+        for alert in alerts:
+            level = alert.get('level', 'warn')
+            bg, border, title_color, icon = level_style[level]
+            card = QtWidgets.QFrame()
+            card.setStyleSheet(
+                f'background: {bg}; border-left: 4px solid {border}; border-radius: 6px; padding: 8px 10px;'
+            )
+            card_layout = QtWidgets.QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 8, 8, 8)
+            card_layout.setSpacing(4)
+
+            title = QtWidgets.QLabel(f'{icon} {alert.get("title", "")}' )
+            title.setStyleSheet(f'color: {title_color}; font-weight: 700;')
+            detail = QtWidgets.QLabel(alert.get('detail', ''))
+            detail.setWordWrap(True)
+            detail.setStyleSheet('color: #e2e8f0;')
+
+            card_layout.addWidget(title)
+            card_layout.addWidget(detail)
+            self.alert_layout.addWidget(card)
+        self.alert_layout.addStretch(1)
+
+    def _build_overview(self, layout: QtWidgets.QGridLayout) -> None:
+        self.metric_labels: dict[str, QtWidgets.QLabel] = {}
+        items = [
+            ('uptime', '运行时间'),
+            ('rx_bytes', '接收'),
+            ('throughput', '吞吐量'),
+            ('waste_rate', '废字节率'),
+            ('loss_rate', '总丢包率'),
+            ('crc_err', 'CRC错误'),
+        ]
+        for idx, (key, title) in enumerate(items):
+            row = idx // 3
+            col = (idx % 3) * 2
+            title_label = QtWidgets.QLabel(f'{title}:')
+            title_label.setStyleSheet('color: #94a3b8;')
+            value_label = QtWidgets.QLabel('--')
+            value_label.setStyleSheet('color: #e2e8f0; font-size: 15px; font-weight: 600;')
+            layout.addWidget(title_label, row, col)
+            layout.addWidget(value_label, row, col + 1)
+            self.metric_labels[key] = value_label
+
+    def _build_packet_table(self, layout: QtWidgets.QGridLayout) -> None:
+        headers = ['包类型', '成功', 'CRC错误', '丢包率', '频率']
+        for col, name in enumerate(headers):
+            label = QtWidgets.QLabel(name)
+            label.setStyleSheet('color: #94a3b8; font-weight: 600;')
+            layout.addWidget(label, 0, col)
+
+        for row, pkt_class in enumerate(self.packet_classes, start=1):
+            hdr = pkt_class.HEADER
+            badge = QtWidgets.QLabel(f'0x{hdr:02X}  {self.packet_names[hdr]}')
+            badge.setStyleSheet('background: #1f2438; border: 1px solid #3a3f57; border-radius: 8px; padding: 2px 8px; color: #cbd5e1;')
+            ok_label = QtWidgets.QLabel('0')
+            crc_label = QtWidgets.QLabel('0')
+            loss_label = QtWidgets.QLabel('0.00%')
+            rate_label = QtWidgets.QLabel('0.0 Hz')
+            for col, widget in enumerate([badge, ok_label, crc_label, loss_label, rate_label]):
+                layout.addWidget(widget, row, col)
+            self._packet_rows[hdr] = {
+                'ok': ok_label,
+                'crc': crc_label,
+                'loss': loss_label,
+                'rate': rate_label,
+            }
+
+    def _build_interval_table(self, layout: QtWidgets.QGridLayout) -> None:
+        headers = ['包类型', '平均', '最小', '最大', '抖动']
+        for col, name in enumerate(headers):
+            label = QtWidgets.QLabel(name)
+            label.setStyleSheet('color: #94a3b8; font-weight: 600;')
+            layout.addWidget(label, 0, col)
+
+        for row, pkt_class in enumerate(self.packet_classes, start=1):
+            hdr = pkt_class.HEADER
+            name = QtWidgets.QLabel(f'0x{hdr:02X}  {self.packet_names[hdr]}')
+            avg_label = QtWidgets.QLabel('--')
+            min_label = QtWidgets.QLabel('--')
+            max_label = QtWidgets.QLabel('--')
+            jitter_label = QtWidgets.QLabel('--')
+            for col, widget in enumerate([name, avg_label, min_label, max_label, jitter_label]):
+                layout.addWidget(widget, row, col)
+            self._interval_rows[hdr] = {
+                'avg': avg_label,
+                'min': min_label,
+                'max': max_label,
+                'jitter': jitter_label,
+            }
+
+    def _build_plot(self, layout: QtWidgets.QGridLayout) -> None:
+        self.rate_figure = Figure(facecolor='#1a1d2e')
+        self.rate_canvas = FigureCanvasQTAgg(self.rate_figure)
+        self.rate_ax = self.rate_figure.add_subplot(111)
+        self.rate_ax.set_facecolor('#11131f')
+        for spine in self.rate_ax.spines.values():
+            spine.set_color('#3f4666')
+        self.rate_ax.tick_params(colors='#cbd5e1')
+        self.rate_ax.grid(True, color='#32374e', linestyle='--', alpha=0.35)
+        self.rate_ax.set_xlim(-30, 0)
+        self.rate_ax.set_title('Packet Rate (pps)', color='#e5e7eb')
+        self.rate_ax.set_xlabel('Seconds', color='#cbd5e1')
+        self.rate_ax.set_ylabel('pps', color='#cbd5e1')
+        layout.addWidget(self.rate_canvas, 0, 0)
+
+    def _set_connection_state(self, connected: bool) -> None:
+        if connected:
+            self.conn_indicator.setText('● 已连接')
+            self.conn_indicator.setStyleSheet('color: #34d399; font-weight: 600;')
+            self.connect_button.setEnabled(False)
+            self.disconnect_button.setEnabled(True)
+            self.hint_stack.setCurrentIndex(1)
+            self.ui_timer.start()
+        else:
+            self.conn_indicator.setText('● 未连接')
+            self.conn_indicator.setStyleSheet('color: #ef4444; font-weight: 600;')
+            self.connect_button.setEnabled(True)
+            self.disconnect_button.setEnabled(False)
+            self.hint_stack.setCurrentIndex(0)
+            self.ui_timer.stop()
+
+    def refresh_ports(self) -> None:
+        current = self.port_combo.currentText()
+        self.port_combo.clear()
+        ports = serial.tools.list_ports.comports()
+        if not ports:
+            self.port_combo.addItem('')
+            return
+        for p in ports:
+            self.port_combo.addItem(p.device)
+        idx = self.port_combo.findText(current)
+        if idx >= 0:
+            self.port_combo.setCurrentIndex(idx)
+
+    def connect_serial(self) -> None:
+        if self.serial_port and self.serial_port.is_open:
+            return
+        port = self.port_combo.currentText().strip()
+        if not port:
+            self._show_status_message('未选择串口')
+            return
+        try:
+            baud = int(self.baud_combo.currentText())
+            self.serial_port = serial.Serial(port=port, baudrate=baud, timeout=0.05)
+            self.reader_thread = DiagReaderThread(self.serial_port, self.serial_lock, self.packet_headers)
+            self.reader_thread.stats_updated.connect(self._on_stats_updated)
+            self.reader_thread.serial_error.connect(self._show_status_message)
+            self.reader_thread.start()
+            self._set_connection_state(True)
+        except Exception as exc:
+            self.serial_port = None
+            self._set_connection_state(False)
+            self._show_status_message(f'连接失败: {exc}')
+
+    def disconnect_serial(self) -> None:
+        if self.reader_thread:
+            self.reader_thread.stop()
+            self.reader_thread.wait(500)
+            self.reader_thread = None
+        if self.serial_port:
+            try:
+                if self.serial_port.is_open:
+                    self.serial_port.close()
+            except Exception as exc:
+                self._show_status_message(f'断开异常: {exc}')
+            self.serial_port = None
+        self._set_connection_state(False)
+
+    def reset_stats(self) -> None:
+        if self.reader_thread:
+            self.reader_thread.reset_stats()
+        self.latest_stats = None
+        now = time.monotonic()
+        for hdr in self.packet_headers:
+            self.rate_history[hdr].clear()
+            self.rate_history[hdr].append((now, 0.0))
+        self._refresh_ui(force_zero=True)
+
+    @QtCore.pyqtSlot(dict)
+    def _on_stats_updated(self, stats: dict) -> None:
+        self.latest_stats = stats
+
+    def _rate_color(self, value: float) -> str:
+        if value < 0.01:
+            return self.LOSS_GOOD
+        if value < 0.05:
+            return self.LOSS_WARN
+        return self.LOSS_BAD
+
+    def _format_bytes(self, count: int) -> str:
+        if count < 1024:
+            return f'{count} B'
+        if count < 1024 * 1024:
+            return f'{count / 1024.0:.1f} KB'
+        return f'{count / (1024.0 * 1024.0):.2f} MB'
+
+    def _format_duration(self, seconds: float) -> str:
+        total = int(max(0, seconds))
+        h = total // 3600
+        m = (total % 3600) // 60
+        s = total % 60
+        return f'{h:02d}:{m:02d}:{s:02d}'
+
+    def _refresh_ui(self, force_zero: bool = False) -> None:
+        stats = None if force_zero else self.latest_stats
+        if stats is None:
+            self._update_alerts(None)
+            self.metric_labels['uptime'].setText('00:00:00')
+            self.metric_labels['rx_bytes'].setText('0 B')
+            self.metric_labels['throughput'].setText('0.0 B/s')
+            self.metric_labels['waste_rate'].setText('0.00%')
+            self.metric_labels['waste_rate'].setStyleSheet('color: #e2e8f0; font-size: 15px; font-weight: 600;')
+            self.metric_labels['loss_rate'].setText('0.00%')
+            self.metric_labels['loss_rate'].setStyleSheet('color: #e2e8f0; font-size: 15px; font-weight: 600;')
+            self.metric_labels['crc_err'].setText('0')
+            self._update_tables({})
+            self._update_advanced_table(None)
+            self._update_plot()
+            return
+
+        self._update_alerts(stats)
+
+        elapsed = float(stats.get('elapsed', 0.0))
+        total_bytes = int(stats.get('total_bytes', 0))
+        throughput_bps = float(stats.get('throughput_bps', 0.0))
+        waste_rate = float(stats.get('waste_rate', 0.0))
+        loss_rate = float(stats.get('loss_rate', 0.0))
+        total_crc_err = int(stats.get('total_crc_err', 0))
+
+        self.metric_labels['uptime'].setText(self._format_duration(elapsed))
+        self.metric_labels['rx_bytes'].setText(self._format_bytes(total_bytes))
+        self.metric_labels['throughput'].setText(f'{throughput_bps / 1024.0:.2f} KB/s')
+        self.metric_labels['waste_rate'].setText(f'{waste_rate * 100.0:.2f}%')
+        self.metric_labels['waste_rate'].setStyleSheet(
+            f'color: {self._rate_color(waste_rate)}; font-size: 15px; font-weight: 600;'
+        )
+        self.metric_labels['loss_rate'].setText(f'{loss_rate * 100.0:.2f}%')
+        self.metric_labels['loss_rate'].setStyleSheet(
+            f'color: {self._rate_color(loss_rate)}; font-size: 15px; font-weight: 600;'
+        )
+        self.metric_labels['crc_err'].setText(str(total_crc_err))
+
+        packets = stats.get('packets', {})
+        self._update_tables(packets)
+        self._update_advanced_table(stats)
+        now = time.monotonic()
+        for hdr in self.packet_headers:
+            pkt_info = packets.get(hdr, {})
+            self.rate_history[hdr].append((now, float(pkt_info.get('rate_hz', 0.0))))
+        self._update_plot()
+
+    def _update_tables(self, packets: dict) -> None:
+        for hdr in self.packet_headers:
+            pkt_info = packets.get(hdr, {})
+            ok = int(pkt_info.get('ok', 0))
+            crc_err = int(pkt_info.get('crc_err', 0))
+            total = ok + crc_err
+            loss = (crc_err / total) if total > 0 else 0.0
+            rate = float(pkt_info.get('rate_hz', 0.0))
+
+            row = self._packet_rows[hdr]
+            row['ok'].setText(str(ok))
+            row['crc'].setText(str(crc_err))
+            row['loss'].setText(f'{loss * 100.0:.2f}%')
+            row['loss'].setStyleSheet(f'color: {self._rate_color(loss)}; font-weight: 600;')
+            row['rate'].setText(f'{rate:.1f} Hz')
+
+            interval_row = self._interval_rows[hdr]
+            avg_ms = float(pkt_info.get('interval_avg_ms', 0.0))
+            min_ms = float(pkt_info.get('interval_min_ms', 0.0))
+            max_ms = float(pkt_info.get('interval_max_ms', 0.0))
+            std_ms = float(pkt_info.get('jitter_std_ms', 0.0))
+
+            interval_row['avg'].setText('--' if avg_ms <= 0 else f'{avg_ms:.1f} ms')
+            interval_row['min'].setText('--' if min_ms <= 0 else f'{min_ms:.1f} ms')
+            interval_row['max'].setText('--' if max_ms <= 0 else f'{max_ms:.1f} ms')
+            interval_row['jitter'].setText('--' if std_ms <= 0 else f'±{std_ms:.1f} ms')
+
+            expected = self.expected_interval_ms.get(hdr)
+            if expected and max_ms > expected * 2.0:
+                interval_row['max'].setStyleSheet('color: #ef4444; font-weight: 600;')
+            else:
+                interval_row['max'].setStyleSheet('color: #e2e8f0;')
+
+    def _update_plot(self) -> None:
+        self.rate_ax.clear()
+        self.rate_ax.set_facecolor('#11131f')
+        for spine in self.rate_ax.spines.values():
+            spine.set_color('#3f4666')
+        self.rate_ax.tick_params(colors='#cbd5e1')
+        self.rate_ax.grid(True, color='#32374e', linestyle='--', alpha=0.35)
+        self.rate_ax.set_xlim(-30, 0)
+        self.rate_ax.set_title('Packet Rate (pps)', color='#e5e7eb')
+        self.rate_ax.set_xlabel('Seconds', color='#cbd5e1')
+        self.rate_ax.set_ylabel('pps', color='#cbd5e1')
+
+        color_map = ['#60a5fa', '#fb923c', '#34d399', '#f87171']
+        now = time.monotonic()
+        max_y = 1.0
+        for idx, hdr in enumerate(self.packet_headers):
+            series = [(t, v) for t, v in self.rate_history[hdr] if t >= now - 30.0]
+            if not series:
+                continue
+            xs = [t - now for t, _ in series]
+            ys = [v for _, v in series]
+            max_y = max(max_y, max(ys))
+            self.rate_ax.plot(xs, ys, color=color_map[idx % len(color_map)], linewidth=1.8, label=f'0x{hdr:02X} {self.packet_names[hdr]}')
+
+        self.rate_ax.set_ylim(0, max_y * 1.2)
+        if self.packet_headers:
+            legend = self.rate_ax.legend(loc='upper left', facecolor='#1f2438', edgecolor='#3f4666')
+            if legend:
+                for text in legend.get_texts():
+                    text.set_color('#e2e8f0')
+        self.rate_canvas.draw_idle()
+
+    def _show_status_message(self, msg: str) -> None:
+        if self.window() and isinstance(self.window(), QtWidgets.QMainWindow):
+            self.window().statusBar().showMessage(msg, 3000)
+
+    def shutdown(self) -> None:
+        self.disconnect_serial()
+
+
 class ConnectivityTab(QtWidgets.QWidget):
     STATUS_META = {
         'ok': ('✅', '#34d399'),
@@ -1196,10 +2079,12 @@ class SentryToolboxWindow(QtWidgets.QMainWindow):
         self.serial_tab = SerialMockTab(self)
         self.map_tab = MapPickerTab(self)
         self.connectivity_tab = ConnectivityTab(self)
+        self.diag_tab = SerialDiagTab(self)
 
         self.tabs.addTab(self.serial_tab, '串口 Mock')
         self.tabs.addTab(self.map_tab, '地图坐标拾取')
         self.tabs.addTab(self.connectivity_tab, '连通性检测')
+        self.tabs.addTab(self.diag_tab, '串口诊断')
 
         self.status_label = QtWidgets.QLabel('Ready')
         self.statusBar().addPermanentWidget(self.status_label, 1)
@@ -1207,6 +2092,7 @@ class SentryToolboxWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.serial_tab.shutdown()
+        self.diag_tab.shutdown()
         super().closeEvent(event)
 
     def _apply_dark_theme(self) -> None:

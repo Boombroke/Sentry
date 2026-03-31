@@ -126,6 +126,41 @@ ros2 launch serial_driver serial_driver.launch.py device_name:=/dev/pts/4
 | 行为树不执行 | sentry_behavior_server + referee topic | `fix_build.sh` |
 | 所有都红 | 全部 | `setup_env.sh`（一键修复按钮）|
 
+### 标签页 4：串口诊断
+
+连接真实串口，被动监听链路质量。**独立串口连接**，不与 Mock tab 共享。
+
+**操作步骤：**
+
+1. 选择真实串口设备（如 `/dev/ttyACM0`）和波特率，点击 Connect
+2. 面板自动开始统计，每 500ms 刷新
+3. 观察智能告警面板（顶部）获取问题诊断
+4. 点击「重置统计」清零重新统计
+
+**面板说明：**
+
+| 面板 | 内容 | 默认 |
+|---|---|---|
+| 智能告警 | 自动检测波特率不匹配、协议错误、CRC 异常等 | 展开 |
+| 链路总览 | 运行时间、吞吐量、废字节率、总丢包率 | 展开 |
+| 各包类型统计 | 0xA1/0xA2/0xA3 成功/CRC错误/丢包率/频率 | 展开 |
+| 包间隔分析 | 平均/最小/最大/抖动，异常标红 | 折叠 |
+| 高级诊断 | 帧同步失败、缓冲区溢出、连续CRC错误等 7 项 | 折叠 |
+| 实时速率曲线 | 30s 滚动图，每类包一条线 | 展开 |
+
+**智能告警自动检测：**
+
+| 告警 | 触发条件 |
+|---|---|
+| 🔴 疑似波特率不匹配 | 运行>2s 无有效包 + 废字节率极高 |
+| 🔴 疑似协议不匹配 | >1KB 数据但 0 有效包 |
+| 🔴 CRC 错误率过高 | >5% |
+| 🟡 连续 CRC 错误 | 峰值≥5 |
+| 🔴 最长无包间隔 | >2s |
+| 🟡 缓冲区溢出 | >0 次 |
+| 🟡 IMU 数据跳变 | >5 次 |
+| 🟢 链路正常 | 运行>3s 无异常 |
+
 ---
 
 ## 串口数据可视化 (serial_visualizer.py)
@@ -196,7 +231,7 @@ cd /path/to/workspace && colcon build --packages-select rm_serial_driver
 
 ```text
 src/sentry_tools/
-├── sentry_toolbox.py          # 工具箱（串口 Mock + 地图拾取 + 连通性检测）
+├── sentry_toolbox.py          # 工具箱（串口Mock + 地图拾取 + 连通性检测 + 串口诊断）
 ├── serial_visualizer.py       # 串口数据实时可视化（需 ROS）
 ├── protocol.py                # 协议定义（由 generate.py 生成，勿手动编辑）
 └── README.md
