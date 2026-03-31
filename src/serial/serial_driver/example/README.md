@@ -31,21 +31,19 @@
 
 将 `navigation_auto.h` 和 `navigation_auto.c` 复制到 STM32 工程中。
 
-### 2. 初始化（上电调用一次）
+### 2. 创建 FreeRTOS 任务
 
 ```c
 #include "navigation_auto.h"
 
-Navigation_Init();
-```
-
-### 3. 主循环调用
-
-```c
-// 假设主循环 ~1000Hz
-void Main_Loop(void)
+void NavigationTask(void const *argument)
 {
-    Navigation_Task();
+    Navigation_Init();
+
+    for (;;) {
+        Navigation_Task();
+        osDelay(1);  // 1ms -> ~1000Hz
+    }
 }
 ```
 
@@ -82,7 +80,7 @@ float w  = navigation.vel_w;    // 角速度 (rad/s)
 
 ### 发送频率
 
-默认假设主循环 ~1000Hz。如果频率不同，调整 `.h` 中的宏：
+默认假设任务以 1ms 周期运行（~1000Hz）。如果 `osDelay` 不同，调整 `.h` 中的宏：
 
 ```c
 #define SEND_IMU_INTERVAL       1    // 每 N 个 tick 发一次

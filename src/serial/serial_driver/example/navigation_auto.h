@@ -13,7 +13,7 @@
 #define FH_TX_HP       0xA3
 #define FH_RX          0xB5
 
-// Main loop ~1000Hz. Interval in ticks.
+// FreeRTOS task ~1000Hz (osDelay(1)). Interval in ticks.
 #define SEND_IMU_INTERVAL       1
 #define SEND_STATUS_INTERVAL  100
 #define SEND_HP_INTERVAL      500
