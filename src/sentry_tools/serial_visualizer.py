@@ -121,13 +121,13 @@ class SerialVisualizerNode(Node):
         #   This is in gimbal_yaw_fake frame ≈ world frame (fixed yaw), no spin_speed added.
         #   Directly comparable to /odometry twist which is also in world (odom) frame.
         self.create_subscription(Twist, 'cmd_vel_nav2_result', self._on_cmd_vel, 10)
-        # Also subscribe to final /cmd_vel (after fake_vel_transform, includes spin + frame rotation)
-        # for display purposes (what actually gets sent to motors).
-        self.create_subscription(Twist, '/cmd_vel', self._on_final_cmd_vel, 10)
+        # All topic names are relative so they respect the node's namespace.
+        # Launch with: --ros-args -r __ns:=/red_standard_robot1
+        self.create_subscription(Twist, 'cmd_vel', self._on_final_cmd_vel, 10)
         self.create_subscription(GameStatus, 'referee/game_status', self._on_game_status, 10)
         self.create_subscription(RobotStatus, 'referee/robot_status', self._on_robot_status, 10)
         self.create_subscription(GameRobotHP, 'referee/all_robot_hp', self._on_all_robot_hp, 10)
-        self.create_subscription(Odometry, '/odometry', self._on_odometry, 10)
+        self.create_subscription(Odometry, 'odometry', self._on_odometry, 10)
 
         # Cache last nav cmd_vel (world frame, no spin) for error computation
         self._last_cmd_vx = 0.0
@@ -338,24 +338,29 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- Gimbal plot ---
         gimbal_box = DashboardPanel('云台姿态')
         gimbal_layout = QtWidgets.QVBoxLayout(gimbal_box)
-        self.gimbal_plot = PlotCanvas('Pitch / Yaw 实时曲线 (最近10s)')
+        self.gimbal_plot = PlotCanvas('Pitch / Yaw (最近10s)')
         gimbal_layout.addWidget(self.gimbal_plot)
 
-        # --- Velocity comparison plot (cmd_vel vs actual) ---
-        vel_box = DashboardPanel('速度对比 (命令 vs 实际)')
-        vel_layout = QtWidgets.QVBoxLayout(vel_box)
-        self.vel_plot = PlotCanvas('Vx / Vy / Vw — 实线=命令, 虚线=实际 (最近10s)')
-        vel_layout.addWidget(self.vel_plot)
+        # --- Per-axis velocity plots (cmd vs actual, one chart per axis) ---
+        vx_box = DashboardPanel('Vx 对比')
+        vx_layout = QtWidgets.QVBoxLayout(vx_box)
+        self.vx_plot = PlotCanvas('Vx — 命令 vs 实际 (m/s)')
+        vx_layout.addWidget(self.vx_plot)
 
-        # --- Velocity error plot ---
-        err_box = DashboardPanel('速度跟踪误差 (命令 - 实际)')
-        err_layout = QtWidgets.QVBoxLayout(err_box)
-        self.err_plot = PlotCanvas('Δvx / Δvy / Δvw 误差 (最近10s)')
-        err_layout.addWidget(self.err_plot)
+        vy_box = DashboardPanel('Vy 对比')
+        vy_layout = QtWidgets.QVBoxLayout(vy_box)
+        self.vy_plot = PlotCanvas('Vy — 命令 vs 实际 (m/s)')
+        vy_layout.addWidget(self.vy_plot)
+
+        vw_box = DashboardPanel('Vw 对比')
+        vw_layout = QtWidgets.QVBoxLayout(vw_box)
+        self.vw_plot = PlotCanvas('Vw — 命令 vs 实际 (rad/s)')
+        vw_layout.addWidget(self.vw_plot)
 
         left_layout.addWidget(gimbal_box, stretch=1)
-        left_layout.addWidget(vel_box, stretch=1)
-        left_layout.addWidget(err_box, stretch=1)
+        left_layout.addWidget(vx_box, stretch=1)
+        left_layout.addWidget(vy_box, stretch=1)
+        left_layout.addWidget(vw_box, stretch=1)
 
         # --- Right panel ---
         right_widget = QtWidgets.QWidget()
@@ -624,7 +629,6 @@ class MainWindow(QtWidgets.QMainWindow):
             '角度 (rad)',
         )
 
-        # --- Velocity comparison plot (cmd solid, actual dashed) ---
         x_cmd, y_cmd_vx = self._extract_window(cmd_t, cmd_vx, now)
         _, y_cmd_vy = self._extract_window(cmd_t, cmd_vy, now)
         _, y_cmd_vw = self._extract_window(cmd_t, cmd_vw, now)
@@ -633,25 +637,29 @@ class MainWindow(QtWidgets.QMainWindow):
         _, y_odom_vy = self._extract_window(odom_t, odom_vy, now)
         _, y_odom_vw = self._extract_window(odom_t, odom_vw, now)
 
-        self.vel_plot.update_plot(
-            [x_cmd, x_cmd, x_cmd, x_odom, x_odom, x_odom],
-            [y_cmd_vx, y_cmd_vy, y_cmd_vw, y_odom_vx, y_odom_vy, y_odom_vw],
-            ['cmd vx', 'cmd vy', 'cmd vw', 'act vx', 'act vy', 'act vw'],
-            ['#4f8cff', '#ff9f43', '#22c55e', '#4f8cff', '#ff9f43', '#22c55e'],
-            '速度',
-            linestyles=['-', '-', '-', '--', '--', '--'],
+        self.vx_plot.update_plot(
+            [x_cmd, x_odom],
+            [y_cmd_vx, y_odom_vx],
+            ['cmd', 'actual'],
+            ['#4f8cff', '#4f8cff'],
+            'm/s',
+            linestyles=['-', '--'],
         )
-
-        # --- Velocity error plot ---
-        x_err, y_err_vx = self._extract_window(err_t, err_vx, now)
-        _, y_err_vy = self._extract_window(err_t, err_vy, now)
-        _, y_err_vw = self._extract_window(err_t, err_vw, now)
-        self.err_plot.update_plot(
-            x_err,
-            [y_err_vx, y_err_vy, y_err_vw],
-            ['Δvx', 'Δvy', 'Δvw'],
-            ['#f87171', '#fbbf24', '#a78bfa'],
-            '误差',
+        self.vy_plot.update_plot(
+            [x_cmd, x_odom],
+            [y_cmd_vy, y_odom_vy],
+            ['cmd', 'actual'],
+            ['#ff9f43', '#ff9f43'],
+            'm/s',
+            linestyles=['-', '--'],
+        )
+        self.vw_plot.update_plot(
+            [x_cmd, x_odom],
+            [y_cmd_vw, y_odom_vw],
+            ['cmd', 'actual'],
+            ['#22c55e', '#22c55e'],
+            'rad/s',
+            linestyles=['-', '--'],
         )
 
         # --- Game status ---

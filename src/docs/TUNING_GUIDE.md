@@ -283,7 +283,95 @@ grep "GICP" /tmp/nav_log.txt
 
 ---
 
-## 六、快速诊断命令汇总
+## 六、速度平滑器 (velocity_smoother)
+
+velocity_smoother 是 Nav2 官方节点，位于 controller_server 和 fake_vel_transform 之间，负责限制加速度和最大速度，防止指令突变。
+
+### 14. smoothing_frequency（平滑器频率）
+
+**当前值**：仿真 20Hz，实车 40Hz
+
+**核心原则**：必须与 `controller_frequency` 一致，否则高频端指令被丢弃。
+
+| 环境 | controller_frequency | smoothing_frequency | 状态 |
+|---|---|---|---|
+| 仿真 | 20 | 20 | ✅ 匹配 |
+| 实车 | 40 | 40 | ✅ 匹配 |
+
+**判断标准**：
+- `ros2 topic hz cmd_vel_nav2_result` 应接近 `smoothing_frequency`
+- 如果明显低于设定值 → CPU 不足，降低频率
+
+### 15. feedback 模式
+
+**当前值**：`OPEN_LOOP`
+
+| 模式 | 行为 | 适用场景 |
+|---|---|---|
+| `OPEN_LOOP` | 以上一次输出的指令作为"当前速度"计算加速度 | 底盘响应好、不需要精确跟踪 |
+| `CLOSED_LOOP` | 读 odometry 实际速度作为"当前速度" | 底盘响应延迟大、打滑严重 |
+
+**调优方法**：
+```bash
+# 运行 serial_visualizer 观察 cmd vs actual 曲线
+# 仿真:
+python3 src/sentry_tools/serial_visualizer.py --ros-args -r __ns:=/red_standard_robot1
+# 实车:
+python3 src/sentry_tools/serial_visualizer.py
+```
+
+**判断标准**：
+- 实际速度能跟上命令，误差 < 0.2 m/s → `OPEN_LOOP` 够用
+- 实际速度明显滞后或超调 → 切 `CLOSED_LOOP`
+- `CLOSED_LOOP` 依赖 odometry 质量，如果里程计有噪声反而可能引入抖动
+
+### 16. max_accel / max_decel（加速度限制）
+
+**当前值**：`[4.5, 4.5, 5.0]` / `[-4.5, -4.5, -5.0]`
+
+**调优范围**：1.0 ~ 6.0 m/s²
+
+**影响**：
+- 过大 → 底盘实际跟不上（轮子打滑），smoother 形同虚设
+- 过小 → 机器人加速慢，响应迟钝
+
+**调优方法**：
+```bash
+# 1. 用 serial_visualizer 给导航目标，观察加速段：
+#    - cmd 曲线是平滑斜坡（smoother 在限制）
+#    - actual 曲线紧跟 cmd → 当前加速度合适
+#    - actual 曲线明显低于 cmd → 加速度超过底盘能力，减小
+
+# 2. 估算底盘最大加速度：
+#    观察 actual 曲线从 0 到峰值的斜率 = 实际最大加速度
+#    max_accel 应 <= 实际最大加速度的 80%
+```
+
+**判断标准**：
+- 仿真摩擦力限制 ≈ 0.2g ≈ 2.0 m/s²，当前 4.5 超过物理极限（仿真中 smoother 无实际意义）
+- 实车需实测：全速加速时观察轮子是否打滑
+
+### 17. max_velocity（最大速度限制）
+
+**当前值**：`[2.5, 2.5, 3.0]`
+
+应与 controller 的 `v_linear_max` / `v_angular_max` 一致或略大。如果 smoother 限速比 controller 小，controller 的指令会被截断。
+
+### 18. deadband_velocity（死区）
+
+**当前值**：`[0.0, 0.0, 0.0]`
+
+**调优范围**：0.0 ~ 0.05
+
+**影响**：低于死区的速度被归零，消除低速抖动。
+
+**判断标准**：
+- serial_visualizer 中静止时 cmd 在 ±0.02 范围内抖动 → 设 `[0.02, 0.02, 0.05]`
+- 没有抖动 → 保持 0
+
+---
+
+## 七、快速诊断命令汇总
 
 ```bash
 # Point-LIO 里程计频率（应接近 LiDAR 频率）

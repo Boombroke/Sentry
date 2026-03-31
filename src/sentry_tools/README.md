@@ -163,12 +163,17 @@ ros2 launch serial_driver serial_driver.launch.py device_name:=/dev/pts/4
 
 ---
 
-## 串口数据可视化 (serial_visualizer.py)
+## 数据可视化 (serial_visualizer.py)
 
-订阅 ROS topic 实时显示串口链路数据。暗色主题，类似轻量版 Foxglove。
+订阅 ROS topic 实时显示导航速度、裁判系统等数据。暗色主题，仿真和实车通用。
 
 ```bash
 source /opt/ros/humble/setup.bash && source install/setup.bash
+
+# 仿真环境（话题在 namespace 下）
+python3 src/sentry_tools/serial_visualizer.py --ros-args -r __ns:=/red_standard_robot1
+
+# 实车环境（话题在根 namespace）
 python3 src/sentry_tools/serial_visualizer.py
 ```
 
@@ -176,12 +181,28 @@ python3 src/sentry_tools/serial_visualizer.py
 
 | 区域 | 内容 |
 |---|---|
-| 左上 | 云台 pitch/yaw 滚动曲线（10s 窗口） |
-| 左下 | 导航速度 vx/vy/vw 滚动曲线 |
+| 左1 | 云台 pitch/yaw 滚动曲线（10s 窗口） |
+| 左2 | Vx 对比：命令（实线）vs 实际（虚线） |
+| 左3 | Vy 对比：命令（实线）vs 实际（虚线） |
+| 左4 | Vw 对比：命令（实线）vs 实际（虚线） |
 | 右上 | 比赛阶段 + 倒计时进度条 |
-| 右中 | 自身 HP 进度条（绿/黄/红）+ 弹量大字 |
+| 右中 | 自身 HP + 弹量 / 导航命令速度 / 实际速度 / 跟踪误差 / 最终下发速度 |
 | 右下 | 全队 7 条 HP 柱状条 |
 | 底部 | 各 topic 收包状态 ✓/✗ + UI 刷新率 |
+
+**订阅的 topic（均为相对名，受 namespace 控制）：**
+
+| Topic | 用途 |
+|---|---|
+| `cmd_vel_nav2_result` | 导航命令速度（world 系，fake_vel_transform 之前，无自旋） |
+| `cmd_vel` | 最终下发速度（body 系 + spin_speed，fake_vel_transform 之后） |
+| `odometry` | 实际速度（world 系，sensor_scan_generation 位置差分） |
+| `serial/gimbal_joint_state` | 云台关节状态 |
+| `referee/game_status` | 比赛阶段 + 倒计时 |
+| `referee/robot_status` | 血量 + 弹量 |
+| `referee/all_robot_hp` | 全队血量 |
+
+> ⚠️ 速度对比只能用 `cmd_vel_nav2_result`（world 系）vs `odometry`（world 系）。不能用 `cmd_vel`（body 系+自旋 3.14 rad/s），详见 AGENTS.md 第 4 节。
 
 **完整联调 4 终端：**
 
@@ -195,7 +216,7 @@ ros2 launch serial_driver serial_driver.launch.py device_name:=/dev/pts/4
 # C: 串口 Mock（工具箱连另一端）
 python3 src/sentry_tools/sentry_toolbox.py
 
-# D: 数据可视化
+# D: 数据可视化（实车）
 python3 src/sentry_tools/serial_visualizer.py
 ```
 
