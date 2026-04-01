@@ -32,7 +32,6 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   previous_result_t_(Eigen::Isometry3d::Identity()),
   has_localized_(false)
 {
-  // Original parameters
   this->declare_parameter("num_threads", 4);
   this->declare_parameter("num_neighbors", 20);
   this->declare_parameter("global_leaf_size", 0.25);
@@ -46,7 +45,6 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("prior_pcd_file", "");
   this->declare_parameter("init_pose", std::vector<double>{0., 0., 0., 0., 0., 0.});
 
-  // New configurable parameters
   this->declare_parameter("max_iterations", 20);
   this->declare_parameter("accumulated_count_threshold", 20);
   this->declare_parameter("min_range", 0.5);
@@ -54,6 +52,9 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("max_fitness_error", 1.0);
   this->declare_parameter("enable_periodic_relocalization", false);
   this->declare_parameter("relocalization_interval", 30.0);
+  this->declare_parameter("max_correction_distance", 5.0);
+  this->declare_parameter("emergency_max_dist_sq", 50.0);
+  this->declare_parameter("emergency_consecutive_failures", 3);
 
   this->get_parameter("num_threads", num_threads_);
   this->get_parameter("num_neighbors", num_neighbors_);
@@ -74,16 +75,20 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("max_fitness_error", max_fitness_error_);
   this->get_parameter("enable_periodic_relocalization", enable_periodic_relocalization_);
   this->get_parameter("relocalization_interval", relocalization_interval_);
+  this->get_parameter("max_correction_distance", max_correction_distance_);
+  this->get_parameter("emergency_max_dist_sq", emergency_max_dist_sq_);
+  this->get_parameter("emergency_consecutive_failures", emergency_consecutive_failures_);
 
   RCLCPP_INFO(
     this->get_logger(),
     "Parameters: max_iterations=%d, accumulated_threshold=%d, min_range=%.2f, "
-    "min_inlier_ratio=%.2f, max_fitness_error=%.2f, periodic=%s, interval=%.1fs",
+    "min_inlier_ratio=%.2f, max_fitness_error=%.2f, periodic=%s, interval=%.1fs, "
+    "max_correction=%.1fm, emergency_max_dist_sq=%.1f, emergency_after=%d failures",
     max_iterations_, accumulated_count_threshold_, min_range_, min_inlier_ratio_,
     max_fitness_error_, enable_periodic_relocalization_ ? "true" : "false",
-    relocalization_interval_);
+    relocalization_interval_, max_correction_distance_, emergency_max_dist_sq_,
+    emergency_consecutive_failures_);
 
-  // [x, y, z, roll, pitch, yaw] - init_pose parameters
   if (!init_pose_.empty() && init_pose_.size() >= 6) {
     result_t_.translation() << init_pose_[0], init_pose_[1], init_pose_[2];
     result_t_.linear() =
@@ -104,12 +109,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   loadGlobalMap(prior_pcd_file_);
 
-  // Downsample points and convert them into pcl::PointCloud<pcl::PointCovariance>
   target_ = small_gicp::voxelgrid_sampling_omp<
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
     *global_map_, global_leaf_size_);
 
-  // Project target to XY plane to match the source projection in performRegistration()
   for (auto & pt : target_->points) {
     pt.z = 0.0f;
   }
@@ -118,10 +121,8 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     this->get_logger(), "Target map after downsampling: %zu points (leaf_size=%.3f)",
     target_->size(), global_leaf_size_);
 
-  // Estimate covariances of points
   small_gicp::estimate_covariances_omp(*target_, num_neighbors_, num_threads_);
 
-  // Create KdTree for target
   target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
     target_, small_gicp::KdTreeBuilderOMP(num_threads_));
 
@@ -134,7 +135,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     std::bind(&SmallGicpRelocalizationNode::initialPoseCallback, this, std::placeholders::_1));
 
   transform_timer_ = this->create_wall_timer(
-    std::chrono::milliseconds(50),  // 20 Hz
+    std::chrono::milliseconds(50),
     std::bind(&SmallGicpRelocalizationNode::publishTransform, this));
 }
 
@@ -146,7 +147,6 @@ void SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
   }
   RCLCPP_INFO(this->get_logger(), "Loaded global map with %zu points", global_map_->points.size());
 
-  // NOTE: Transform global pcd_map (based on `lidar_odom` frame) to the `odom` frame
   Eigen::Affine3d odom_to_lidar_odom;
   while (true) {
     try {
@@ -169,11 +169,9 @@ void SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
 void SmallGicpRelocalizationNode::registeredPcdCallback(
   const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
-  // Always update scan metadata (needed for initialPoseCallback)
   last_scan_time_ = msg->header.stamp;
   current_scan_frame_id_ = msg->header.frame_id;
 
-  // After initial localization, only accumulate if periodic relocalization is enabled
   if (has_localized_ && !enable_periodic_relocalization_) {
     return;
   }
@@ -181,7 +179,6 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
   pcl::PointCloud<pcl::PointXYZ>::Ptr scan(new pcl::PointCloud<pcl::PointXYZ>());
   pcl::fromROSMsg(*msg, *scan);
 
-  // Filter out near-range points (self-reflections, noise)
   pcl::PointCloud<pcl::PointXYZ>::Ptr filtered(new pcl::PointCloud<pcl::PointXYZ>());
   filtered->reserve(scan->size());
   const double min_range_sq = min_range_ * min_range_;
@@ -198,7 +195,6 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
     accumulated_count_++;
   }
 
-  // Initial localization: trigger after accumulating enough frames
   if (!has_localized_ && accumulated_count_ >= accumulated_count_threshold_) {
     RCLCPP_INFO(
       this->get_logger(), "Accumulated %d frames (%zu points), performing initial registration...",
@@ -209,7 +205,6 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
       has_localized_ = true;
       RCLCPP_INFO(this->get_logger(), "Initial localization succeeded.");
 
-      // Start periodic relocalization timer if enabled
       if (enable_periodic_relocalization_) {
         periodic_timer_ = this->create_wall_timer(
           std::chrono::milliseconds(static_cast<int>(relocalization_interval_ * 1000.0)),
@@ -222,7 +217,6 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
       RCLCPP_WARN(
         this->get_logger(),
         "Initial registration failed quality check. Will retry with more frames...");
-      // Don't set has_localized_, allow more frames to accumulate and retry
     }
 
     std::lock_guard<std::mutex> lock(cloud_mutex_);
@@ -246,10 +240,147 @@ void SmallGicpRelocalizationNode::periodicRegistrationCallback()
     this->get_logger(), "Periodic relocalization: %d frames (%zu points)",
     accumulated_count_, accumulated_cloud_->size());
 
-  performRegistration(true);
+  bool success = performRegistration(true);
+
+  if (!success) {
+    consecutive_periodic_failures_++;
+    RCLCPP_WARN(
+      this->get_logger(),
+      "Periodic relocalization failed (%d/%d consecutive failures)",
+      consecutive_periodic_failures_, emergency_consecutive_failures_);
+
+    if (consecutive_periodic_failures_ >= emergency_consecutive_failures_) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "EMERGENCY: %d consecutive failures detected — possible odometry divergence. "
+        "Attempting emergency relocalization with expanded search...",
+        consecutive_periodic_failures_);
+
+      bool emergency_success = performEmergencyRegistration();
+      if (emergency_success) {
+        RCLCPP_WARN(this->get_logger(), "Emergency relocalization SUCCEEDED. Odometry corrected.");
+        consecutive_periodic_failures_ = 0;
+      } else {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Emergency relocalization FAILED. Robot may need manual intervention (2D Pose Estimate).");
+      }
+    }
+  } else {
+    consecutive_periodic_failures_ = 0;
+  }
 
   accumulated_cloud_->clear();
   accumulated_count_ = 0;
+}
+
+bool SmallGicpRelocalizationNode::performEmergencyRegistration()
+{
+  if (accumulated_cloud_->empty()) {
+    return false;
+  }
+
+  auto source_cloud = accumulated_cloud_;
+
+  source_ = small_gicp::voxelgrid_sampling_omp<
+    pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
+    *source_cloud, registered_leaf_size_ * 2.0);
+
+  for (auto & pt : source_->points) {
+    pt.z = 0.0f;
+  }
+
+  small_gicp::estimate_covariances_omp(*source_, num_neighbors_, num_threads_);
+
+  source_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
+    source_, small_gicp::KdTreeBuilderOMP(num_threads_));
+
+  RCLCPP_WARN(
+    this->get_logger(),
+    "Emergency GICP: source=%zu points, max_dist_sq=%.1f (normal=%.1f), max_iter=%d",
+    source_->size(), emergency_max_dist_sq_, max_dist_sq_, max_iterations_ * 2);
+
+  register_->reduction.num_threads = num_threads_;
+  register_->rejector.max_dist_sq = emergency_max_dist_sq_;
+  register_->optimizer.max_iterations = max_iterations_ * 2;
+
+  // Multi-seed: last accepted result + 4 yaw perturbations (±45°, ±90°)
+  struct Candidate {
+    Eigen::Isometry3d guess;
+    small_gicp::RegistrationResult result;
+    bool valid = false;
+    double score = 0.0;
+  };
+
+  std::vector<Candidate> candidates;
+  Eigen::Isometry3d base_guess = previous_result_t_;
+  double base_yaw = std::atan2(base_guess.rotation()(1, 0), base_guess.rotation()(0, 0));
+
+  for (double yaw_offset : {0.0, M_PI / 4, -M_PI / 4, M_PI / 2, -M_PI / 2}) {
+    Eigen::Isometry3d guess = Eigen::Isometry3d::Identity();
+    guess.translation() = base_guess.translation();
+    double yaw = base_yaw + yaw_offset;
+    guess.linear() = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    candidates.push_back({guess, {}, false, 0.0});
+  }
+
+  int best_idx = -1;
+  double best_score = -1.0;
+  constexpr size_t kMinAbsoluteInliers = 50;
+
+  for (size_t i = 0; i < candidates.size(); i++) {
+    auto res = register_->align(*target_, *source_, *target_tree_, candidates[i].guess);
+    candidates[i].result = res;
+
+    if (!res.converged || res.num_inliers < kMinAbsoluteInliers) {
+      continue;
+    }
+
+    double inlier_ratio = static_cast<double>(res.num_inliers) / source_->size();
+    double fitness_error = res.error / static_cast<double>(res.num_inliers);
+
+    if (inlier_ratio >= min_inlier_ratio_ * 0.5 &&
+        fitness_error <= max_fitness_error_ * 2.0)
+    {
+      double score = static_cast<double>(res.num_inliers) / (fitness_error + 0.001);
+      candidates[i].valid = true;
+      candidates[i].score = score;
+
+      if (score > best_score) {
+        best_score = score;
+        best_idx = static_cast<int>(i);
+      }
+    }
+  }
+
+  RCLCPP_WARN(
+    this->get_logger(), "Emergency: tested %zu candidates, best_idx=%d, best_score=%.1f",
+    candidates.size(), best_idx, best_score);
+
+  bool accepted = (best_idx >= 0);
+  auto result = accepted ? candidates[best_idx].result : candidates[0].result;
+
+  if (!accepted) {
+    return false;
+  }
+
+  const Eigen::Vector3d raw_t = result.T_target_source.translation();
+  const Eigen::Matrix3d raw_r = result.T_target_source.rotation();
+  double yaw = std::atan2(raw_r(1, 0), raw_r(0, 0));
+
+  Eigen::Isometry3d constrained = Eigen::Isometry3d::Identity();
+  constrained.translation() << raw_t.x(), raw_t.y(), 0.0;
+  constrained.linear() =
+    Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+
+  RCLCPP_WARN(
+    this->get_logger(),
+    "Emergency accepted: t=[%.3f, %.3f], yaw=%.3f (correction=%.3f m)",
+    raw_t.x(), raw_t.y(), yaw,
+    (constrained.translation() - result_t_.translation()).norm());
+
+  result_t_ = previous_result_t_ = constrained;
+  return true;
 }
 
 bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
@@ -263,9 +394,6 @@ bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
     *accumulated_cloud_, registered_leaf_size_);
 
-  // Project source points to XY plane (z=0) to constrain GICP to SE(2).
-  // Without this, 6DOF GICP converges to flipped local minima (roll/pitch ≈ π)
-  // in sparse simulation point clouds.  Ground robots only need (x, y, yaw).
   for (auto & pt : source_->points) {
     pt.z = 0.0f;
   }
@@ -289,7 +417,6 @@ bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
 
   auto result = register_->align(*target_, *source_, *target_tree_, previous_result_t_);
 
-  // Extract transform for logging
   const Eigen::Vector3d t = result.T_target_source.translation();
   const Eigen::Vector3d rpy =
     result.T_target_source.rotation().eulerAngles(0, 1, 2);
@@ -308,7 +435,6 @@ bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
     return false;
   }
 
-  // Quality gate: check inlier ratio
   double inlier_ratio = static_cast<double>(result.num_inliers) / source_->size();
   RCLCPP_INFO(this->get_logger(), "GICP inlier_ratio=%.3f (threshold=%.3f)",
     inlier_ratio, min_inlier_ratio_);
@@ -321,7 +447,6 @@ bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
     return false;
   }
 
-  // Quality gate: check fitness error per inlier
   if (result.num_inliers > 0) {
     double fitness_error = result.error / static_cast<double>(result.num_inliers);
     RCLCPP_INFO(this->get_logger(), "GICP fitness_error=%.6f (threshold=%.6f)",
@@ -336,26 +461,21 @@ bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
     }
   }
 
-  // For periodic relocalization, also check that the correction is reasonable
   if (is_periodic) {
     Eigen::Vector3d delta_t =
       result.T_target_source.translation() - result_t_.translation();
     double delta_dist = delta_t.norm();
-    // Reject periodic corrections larger than 2 meters (likely a bad match)
-    if (delta_dist > 2.0) {
+    if (delta_dist > max_correction_distance_) {
       RCLCPP_WARN(
         this->get_logger(),
-        "Periodic reloc: correction too large (%.3f m). Rejecting.", delta_dist);
+        "Periodic reloc: correction too large (%.3f m > %.3f m). Rejecting.",
+        delta_dist, max_correction_distance_);
       return false;
     }
     RCLCPP_INFO(
       this->get_logger(), "Periodic reloc: accepted correction of %.3f m", delta_dist);
   }
 
-  // Constrain GICP result to 2D (x, y, yaw) before storing.
-  // The raw 6DOF result may contain large roll/pitch components (especially in
-  // simulation with sparse point clouds), which can flip the transform and
-  // poison `previous_result_t_` used as the next GICP initial guess.
   const Eigen::Vector3d raw_t = result.T_target_source.translation();
   const Eigen::Matrix3d raw_r = result.T_target_source.rotation();
   double yaw = std::atan2(raw_r(1, 0), raw_r(0, 0));
@@ -385,10 +505,6 @@ void SmallGicpRelocalizationNode::publishTransform()
   transform_stamped.header.frame_id = map_frame_;
   transform_stamped.child_frame_id = odom_frame_;
 
-  // Constrain map->odom to 2D (x, y, yaw only).
-  // GICP returns full 6DOF but for a ground robot the map->odom correction
-  // should only contain planar components. Non-zero z/roll/pitch from GICP
-  // cause the robot to appear below the map and point cloud angles to mismatch.
   const Eigen::Vector3d translation = result_t_.translation();
   const Eigen::Matrix3d rotation = result_t_.rotation();
   double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
@@ -397,7 +513,6 @@ void SmallGicpRelocalizationNode::publishTransform()
   transform_stamped.transform.translation.y = translation.y();
   transform_stamped.transform.translation.z = 0.0;
 
-  // Yaw-only quaternion: [0, 0, sin(yaw/2), cos(yaw/2)]
   transform_stamped.transform.rotation.x = 0.0;
   transform_stamped.transform.rotation.y = 0.0;
   transform_stamped.transform.rotation.z = std::sin(yaw / 2.0);
@@ -428,6 +543,7 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
     Eigen::Isometry3d map_to_odom = map_to_robot_base * robot_base_to_odom;
 
     previous_result_t_ = result_t_ = map_to_odom;
+    consecutive_periodic_failures_ = 0;
   } catch (tf2::TransformException & ex) {
     RCLCPP_WARN(
       this->get_logger(), "Could not transform initial pose from %s to %s: %s",

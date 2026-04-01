@@ -46,13 +46,13 @@ private:
   void periodicRegistrationCallback();
   void loadGlobalMap(const std::string & file_name);
   bool performRegistration(bool is_periodic);
+  bool performEmergencyRegistration();
   void publishTransform();
   void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pcd_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
 
-  // GICP parameters
   int num_threads_;
   int num_neighbors_;
   int max_iterations_;
@@ -62,15 +62,15 @@ private:
   float max_dist_sq_;
   double min_range_;
 
-  // Quality gate parameters
   double min_inlier_ratio_;
   double max_fitness_error_;
 
-  // Periodic relocalization parameters
   bool enable_periodic_relocalization_;
   double relocalization_interval_;
+  double max_correction_distance_;
+  double emergency_max_dist_sq_;
+  int emergency_consecutive_failures_;
 
-  // State
   int accumulated_count_;
   std::vector<double> init_pose_;
 
@@ -104,10 +104,9 @@ private:
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
-  // Whether the initial localization has been completed
   bool has_localized_ = false;
+  int consecutive_periodic_failures_ = 0;
 
-  // Mutex for accumulated_cloud_ access
   std::mutex cloud_mutex_;
 };
 
