@@ -242,50 +242,7 @@ geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityComman
   double theta_dist = atan2(carrot_pose.pose.position.y, carrot_pose.pose.position.x);
   double angle_to_goal = tf2::getYaw(carrot_pose.pose.orientation);
 
-  // Check if the lookahead point is behind the robot (angle > 90 degrees)
-  // If so, find a closer point on the path that is in front of the robot
-  if (fabs(theta_dist) > M_PI / 2.0) {
-    bool found_forward_point = false;
-    for (const auto & pose : transformed_plan.poses) {
-      double angle = atan2(pose.pose.position.y, pose.pose.position.x);
-      if (fabs(angle) <= M_PI / 2.0) {
-        carrot_pose = pose;
-        theta_dist = angle;
-        found_forward_point = true;
-        break;
-      }
-    }
-    
-    // If no forward point found, use the first point on the path
-    if (!found_forward_point && !transformed_plan.poses.empty()) {
-      carrot_pose = transformed_plan.poses[0];
-      theta_dist = atan2(carrot_pose.pose.position.y, carrot_pose.pose.position.x);
-    }
-  }
-
-  // Calculate path distance from robot to lookahead point
-  // Use direct distance to lookahead point for better control
   double lin_dist = hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y);
-
-  // Use path tangent direction instead of direct line to lookahead point
-  // Find a point on the path ahead of the robot to calculate tangent direction
-  size_t tangent_point_index = std::min(size_t(2), transformed_plan.poses.size() - 1);
-  if (transformed_plan.poses.size() > 1) {
-    // Calculate tangent from origin (robot position) to a nearby point on the path
-    const auto & tangent_point = transformed_plan.poses[tangent_point_index].pose.position;
-    theta_dist = atan2(tangent_point.y, tangent_point.x);
-    
-    // For sharp turns, use the direction between first two path points
-    if (tangent_point_index > 0) {
-      const auto & p1 = transformed_plan.poses[0].pose.position;
-      const auto & p2 = transformed_plan.poses[tangent_point_index].pose.position;
-      double dx = p2.x - p1.x;
-      double dy = p2.y - p1.y;
-      if (hypot(dx, dy) > 0.01) {
-        theta_dist = atan2(dy, dx);
-      }
-    }
-  }
 
   if (use_rotate_to_heading_) {
     angle_to_goal = tf2::getYaw(transformed_plan.poses.back().pose.orientation);
@@ -360,7 +317,12 @@ geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityComman
   return cmd_vel;
 }
 
-void OmniPidPursuitController::setPlan(const nav_msgs::msg::Path & path) { global_plan_ = path; }
+void OmniPidPursuitController::setPlan(const nav_msgs::msg::Path & path)
+{
+  global_plan_ = path;
+  last_curvature_ = 0.0;
+  last_velocity_scaling_factor_ = v_linear_max_;
+}
 
 void OmniPidPursuitController::setSpeedLimit(
   const double & /*speed_limit*/, const bool & /*percentage*/)

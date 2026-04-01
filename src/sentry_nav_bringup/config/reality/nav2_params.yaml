@@ -380,7 +380,7 @@ controller_server:
       rotation_kd: 0.3
       transform_tolerance: 0.1
       min_max_sum_error: 1.0
-      lookahead_dist: 0.5
+      lookahead_dist: 2.0
       use_velocity_scaled_lookahead_dist: true
       lookahead_time: 1.0
       min_lookahead_dist: 1.0

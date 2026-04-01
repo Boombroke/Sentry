@@ -70,9 +70,10 @@ robots:
       z_pose: "0.28"
       yaw: "0.0"
 
-    - name: "blue_standard_robot1"
-      color: "blue"
-      x_pose: "11.8"
-      y_pose: "-3.5"
-      z_pose: "0.28"
-      yaw: "3.14"
+    # NOTE: Blue robot disabled to improve Gazebo RTF (halves sensor rendering load)
+    # - name: "blue_standard_robot1"
+    #   color: "blue"
+    #   x_pose: "11.8"
+    #   y_pose: "-3.5"
+    #   z_pose: "0.28"
+    #   yaw: "3.14"

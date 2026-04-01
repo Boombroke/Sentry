@@ -367,8 +367,8 @@ controller_server:
       lookahead_dist: 2.0
       use_velocity_scaled_lookahead_dist: true
       lookahead_time: 1.0
-      min_lookahead_dist: 0.5
-      max_lookahead_dist: 1.0
+      min_lookahead_dist: 1.0
+      max_lookahead_dist: 2.0
       use_interpolation: false
       use_rotate_to_heading: false
       use_rotate_to_heading_treshold: 0.1
