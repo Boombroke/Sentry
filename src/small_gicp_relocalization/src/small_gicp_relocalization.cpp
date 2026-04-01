@@ -55,6 +55,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("max_correction_distance", 5.0);
   this->declare_parameter("emergency_max_dist_sq", 50.0);
   this->declare_parameter("emergency_consecutive_failures", 3);
+  this->declare_parameter("terrain_clearing_threshold", 0.1);
 
   this->get_parameter("num_threads", num_threads_);
   this->get_parameter("num_neighbors", num_neighbors_);
@@ -78,6 +79,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("max_correction_distance", max_correction_distance_);
   this->get_parameter("emergency_max_dist_sq", emergency_max_dist_sq_);
   this->get_parameter("emergency_consecutive_failures", emergency_consecutive_failures_);
+  this->get_parameter("terrain_clearing_threshold", terrain_clearing_threshold_);
 
   RCLCPP_INFO(
     this->get_logger(),
@@ -97,6 +99,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
       Eigen::AngleAxisd(init_pose_[3], Eigen::Vector3d::UnitX()).toRotationMatrix();
   }
   previous_result_t_ = result_t_;
+  accumulation_snapshot_t_ = result_t_;
 
   accumulated_cloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   global_map_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
@@ -125,6 +128,9 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
     target_, small_gicp::KdTreeBuilderOMP(num_threads_));
+
+  map_clearing_pub_ = this->create_publisher<std_msgs::msg::Float32>("map_clearing", 1);
+  cloud_clearing_pub_ = this->create_publisher<std_msgs::msg::Float32>("cloud_clearing", 1);
 
   pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
     "registered_scan", 10,
@@ -191,6 +197,10 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
 
   {
     std::lock_guard<std::mutex> lock(cloud_mutex_);
+    if (accumulated_count_ >= accumulated_count_threshold_) {
+      accumulated_cloud_->clear();
+      accumulated_count_ = 0;
+    }
     *accumulated_cloud_ += *filtered;
     accumulated_count_++;
   }
@@ -272,6 +282,7 @@ void SmallGicpRelocalizationNode::periodicRegistrationCallback()
 
   accumulated_cloud_->clear();
   accumulated_count_ = 0;
+  accumulation_snapshot_t_ = result_t_;
 }
 
 bool SmallGicpRelocalizationNode::performEmergencyRegistration()
@@ -380,6 +391,7 @@ bool SmallGicpRelocalizationNode::performEmergencyRegistration()
     (constrained.translation() - result_t_.translation()).norm());
 
   result_t_ = previous_result_t_ = constrained;
+  notifyTerrainClearing();
   return true;
 }
 
@@ -490,8 +502,26 @@ bool SmallGicpRelocalizationNode::performRegistration(bool is_periodic)
     "Accepted 2D-constrained result: t=[%.3f, %.3f], yaw=%.3f",
     raw_t.x(), raw_t.y(), yaw);
 
+  double correction_dist = (constrained.translation() - result_t_.translation()).norm();
   result_t_ = previous_result_t_ = constrained;
+
+  if (correction_dist > terrain_clearing_threshold_) {
+    notifyTerrainClearing();
+    RCLCPP_WARN(
+      this->get_logger(),
+      "Correction %.3fm > threshold %.3fm, triggered terrain clearing.",
+      correction_dist, terrain_clearing_threshold_);
+  }
+
   return true;
+}
+
+void SmallGicpRelocalizationNode::notifyTerrainClearing()
+{
+  std_msgs::msg::Float32 msg;
+  msg.data = 100.0f;
+  map_clearing_pub_->publish(msg);
+  cloud_clearing_pub_->publish(msg);
 }
 
 void SmallGicpRelocalizationNode::publishTransform()

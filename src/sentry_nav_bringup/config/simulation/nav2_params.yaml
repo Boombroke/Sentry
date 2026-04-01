@@ -121,7 +121,7 @@ terrain_analysis:
     minBlockPointNum: 10
     vehicleHeight: 0.5                  # 小于车辆高度的点才会进行处理
     voxelPointUpdateThre: 100
-    voxelTimeUpdateThre: 1.0
+    voxelTimeUpdateThre: 0.5
     minRelZ: -1.5                       # min_rel_z 以及 max_rel_z 限制了有效点云点的Z值范围，用于对天花板和地板进行处理
     maxRelZ: 0.5
     disRatioZ: 0.2                      # Z 值的最大最小范围由这两个值决定，但是并不等于这两个值，是有一个比例关系的，距离机器人越远，限定范围就越大，这其中考虑了坡度
@@ -136,7 +136,7 @@ terrain_analysis_ext:
     quantileZ: 0.2
     vehicleHeight: 1.0
     voxelPointUpdateThre: 100
-    voxelTimeUpdateThre: 2.0
+    voxelTimeUpdateThre: 0.2
     lowerBoundZ: -1.5
     upperBoundZ: 0.5
     disRatioZ: 0.2
@@ -181,6 +181,7 @@ small_gicp_relocalization:
     max_correction_distance: 5.0
     emergency_max_dist_sq: 25.0
     emergency_consecutive_failures: 3
+    terrain_clearing_threshold: 0.1
     # The prior_pcd_file does not need to be specified since it going to be set by defaults in launch.
     # prior_pcd_file: ""
 

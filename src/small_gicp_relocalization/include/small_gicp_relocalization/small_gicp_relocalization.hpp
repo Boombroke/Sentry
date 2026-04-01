@@ -24,6 +24,7 @@
 #include "pcl/io/pcd_io.h"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "small_gicp/ann/kdtree_omp.hpp"
 #include "small_gicp/factors/gicp_factor.hpp"
 #include "small_gicp/pcl/pcl_point.hpp"
@@ -49,6 +50,7 @@ private:
   bool performEmergencyRegistration();
   void publishTransform();
   void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
+  void notifyTerrainClearing();
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pcd_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
@@ -104,8 +106,13 @@ private:
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr map_clearing_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr cloud_clearing_pub_;
+
   bool has_localized_ = false;
   int consecutive_periodic_failures_ = 0;
+  Eigen::Isometry3d accumulation_snapshot_t_ = Eigen::Isometry3d::Identity();
+  double terrain_clearing_threshold_;
 
   std::mutex cloud_mutex_;
 };
