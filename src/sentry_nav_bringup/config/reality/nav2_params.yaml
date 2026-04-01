@@ -61,7 +61,7 @@ point_lio:
       extrinsic_est_en: False                           # for aggressive motion, set this variable False
       imu_time_inte: 0.005                              # = 1 / frequency of IMU
       lidar_time_inte: 0.033                             # = 1 / LiDAR frequency (mid360 30Hz)
-      satu_acc: 4.0                                     # the saturation value of IMU's acceleration. not related to the units
+      satu_acc: 6.0                                     # BMI088 default ±6g range. Set to IMU physical saturation, not lower.
       satu_gyro: 35.0                                   # the saturation value of IMU's angular velocity. not related to the units
       acc_norm: 1.0                                     # 1.0 for g as unit, 9.81 for m/s^2 as unit of the IMU's acceleration
       lidar_meas_cov: 0.01                              # 0.001
