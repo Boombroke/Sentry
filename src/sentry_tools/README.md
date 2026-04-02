@@ -3,7 +3,7 @@
 ## 快速开始
 
 ```bash
-# 工具箱（串口 Mock + 地图拾取 + 连通性检测），无需 ROS
+# 工具箱（串口 Mock + 地图拾取 + 连通性检测 + 串口诊断 + 重力标定），无需 ROS（重力标定需 ROS）
 python3 src/sentry_tools/sentry_toolbox.py
 
 # 串口数据可视化（需 ROS 环境）
@@ -17,7 +17,7 @@ python3 src/sentry_tools/serial_visualizer.py
 
 ## 工具箱 (sentry_toolbox.py)
 
-三个标签页，暗色主题，无需 ROS 即可运行。
+五个标签页，暗色主题。串口 Mock / 地图拾取 / 连通性检测 / 串口诊断无需 ROS；重力标定需要 ROS 环境。
 
 ### 标签页 1：串口 Mock
 
@@ -160,6 +160,55 @@ ros2 launch serial_driver serial_driver.launch.py device_name:=/dev/pts/4
 | 🟡 缓冲区溢出 | >0 次 |
 | 🟡 IMU 数据跳变 | >5 次 |
 | 🟢 链路正常 | 运行>3s 无异常 |
+
+### 标签页 5：重力标定
+
+采集 Livox mid360 内置 BMI088 IMU 的加速度数据，计算 Point-LIO 所需的 `gravity` 参数向量。**需要 ROS 环境**（通过 `ros2 topic echo` 采集数据）。
+
+**背景：** Point-LIO 启动时通过重力对齐确定初始坐标系方向。`gravity` 参数定义了 IMU 静止时测量到的加速度向量（含重力）。如果该参数与实际不匹配，会导致建图时地图方向不一致。**每次更换雷达或调整安装角度后都需要重新标定。**
+
+**一键标定（推荐）：**
+
+1. 打开工具箱，切换到「重力标定」标签页
+2. 点击「检测雷达连接」确认 LiDAR 可达（自动读取配置中的 LiDAR IP）
+3. 点击「一键标定」：自动执行
+   - 雷达连通性检测（ping）
+   - 检查 Livox 驱动是否已运行
+   - 如未运行则自动启动 `ros2 launch livox_ros_driver2 msg_MID360_launch.py`
+   - 轮询等待 `/livox/imu` 话题就绪（15s 超时）
+   - 自动开始采集并在完成后自动清理由工具箱拉起的驱动
+4. 过程日志显示在上方日志框（带时间戳）
+
+**手动采集（兼容旧流程）：**
+
+1. 确保雷达已安装到最终位置，机器人放在水平地面上，完全静止
+2. 只需启动 Livox 驱动：`ros2 launch livox_ros_driver2 msg_MID360_launch.py`
+3. 打开工具箱，切换到「重力标定」标签页
+4. 确认 IMU Topic（默认 `livox/imu`）和采样数（默认 1000）
+5. 点击「开始采集」，等待进度条完成
+6. 观察标准差（std）：任一轴 >0.05 说明机器人不够静止，需要重新采集
+7. 采集完成后，点击「复制 YAML」将结果复制到剪贴板
+8. 粘贴到 `config/reality/nav2_params.yaml` 的 `mapping:` 段替换 `gravity` 和 `gravity_init`
+
+**也可直接写入配置文件：** 点击「写入配置」→ 选择 `nav2_params.yaml` → 自动替换 `mapping:` 段内的 `gravity` 和 `gravity_init` 值。
+
+**UI 说明：**
+
+| 区域 | 内容 |
+|---|---|
+| 一键标定区 | 检测雷达连接 / 一键标定 / 停止 + 状态指示 + 执行日志 |
+| 顶栏 | IMU Topic 输入、采样数设置、开始/停止按钮、状态指示 |
+| 实时采集 | 进度条、当前/均值/标准差实时显示、X-Y/Y-Z/X-Z 散点投影图 |
+| 标定结果 | acc_norm 选择（1.0g / 9.81m/s²）、gravity 向量、norm 值（颜色编码）、复制/写入按钮 |
+
+**acc_norm 选择：**
+
+| 设置 | 含义 | 实车 mid360 | 仿真 |
+|---|---|---|---|
+| 1.0 | IMU 加速度单位为 g | ✅ 选这个 | — |
+| 9.81 | IMU 加速度单位为 m/s² | — | ✅ 选这个 |
+
+norm 值应接近所选的 acc_norm 值（绿色=正常，黄色=偏差 3-8%，红色=偏差 >8%）。
 
 ---
 

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # pyright: basic, reportAttributeAccessIssue=false, reportArgumentType=false
 
+import atexit
+import json
 import os
 import pathlib
+import signal
 import sys
 import threading
 import collections
@@ -10,6 +13,7 @@ import struct
 import time
 from glob import glob
 import re
+import shutil
 import subprocess
 from typing import Callable
 
@@ -65,6 +69,11 @@ EXPECTED_TF = [
 ]
 
 SCRIPTS_DIR = pathlib.Path(__file__).resolve().parent.parent / 'scripts'
+LIDAR_CONFIG_SEARCH_PATHS = [
+    pathlib.Path(__file__).resolve().parent.parent / 'sentry_nav_bringup' / 'config' / 'reality' / 'mid360_user_config.json',
+    pathlib.Path(__file__).resolve().parent.parent / 'sentry_nav' / 'livox_ros_driver2' / 'config' / 'MID360_config.json',
+]
+DEFAULT_LIDAR_IP = '192.168.1.150'
 
 FIX_SCRIPTS = {
     'ros_env': 'fix_ros_env.sh',
@@ -2065,6 +2074,893 @@ class ConnectivityTab(QtWidgets.QWidget):
         self.summary_label.setText(summary)
 
 
+class GravityCollectorThread(QtCore.QThread):
+    sample_received = QtCore.pyqtSignal(float, float, float)
+    collection_error = QtCore.pyqtSignal(str)
+
+    def __init__(self, topic_name: str, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._topic_name = topic_name.strip() or 'livox/imu'
+        if not self._topic_name.startswith('/'):
+            self._topic_name = f'/{self._topic_name}'
+        self._running = True
+        self._proc: subprocess.Popen | None = None
+
+    def stop(self) -> None:
+        self._running = False
+        self._stop_process()
+
+    def _stop_process(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        finally:
+            self._proc = None
+
+    def _parse_sample(self, line: str) -> tuple[float, float, float] | None:
+        vals = re.findall(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', line)
+        if len(vals) < 3:
+            return None
+        try:
+            return float(vals[0]), float(vals[1]), float(vals[2])
+        except ValueError:
+            return None
+
+    def run(self) -> None:
+        if shutil.which('ros2') is None:
+            self.collection_error.emit('未找到 ros2 命令，请先 source ROS2 环境')
+            return
+
+        cmd = [
+            'ros2',
+            'topic',
+            'echo',
+            self._topic_name,
+            '--field',
+            'linear_acceleration',
+            '--csv',
+        ]
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            self.collection_error.emit('未找到 ros2 命令')
+            return
+        except Exception as exc:
+            self.collection_error.emit(f'启动采集失败: {exc}')
+            return
+
+        try:
+            assert self._proc.stdout is not None
+            while self._running:
+                if self._proc.poll() is not None:
+                    err = ''
+                    if self._proc.stderr is not None:
+                        err = self._proc.stderr.read().strip()
+                    if self._running and err:
+                        self.collection_error.emit(err)
+                    break
+
+                line = self._proc.stdout.readline()
+                if not line:
+                    self.msleep(5)
+                    continue
+
+                sample = self._parse_sample(line.strip())
+                if sample is None:
+                    continue
+                self.sample_received.emit(sample[0], sample[1], sample[2])
+        except Exception as exc:
+            if self._running:
+                self.collection_error.emit(f'采集异常: {exc}')
+        finally:
+            self._stop_process()
+
+
+class LivoxDriverManager:
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._launched_by_us = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def launched_by_us(self) -> bool:
+        return self._launched_by_us
+
+    def launch(self) -> bool:
+        if self.is_running:
+            return True
+        cmd = ['ros2', 'launch', 'livox_ros_driver2', 'msg_MID360_launch.py']
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+            self._launched_by_us = True
+            return True
+        except Exception:
+            self._proc = None
+            self._launched_by_us = False
+            return False
+
+    def stop(self) -> None:
+        if self._proc is None:
+            self._launched_by_us = False
+            return
+        if self._proc.poll() is not None:
+            self._proc = None
+            self._launched_by_us = False
+            return
+
+        try:
+            os.killpg(self._proc.pid, signal.SIGINT)
+            self._proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(self._proc.pid, signal.SIGTERM)
+                self._proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self._proc.pid, signal.SIGKILL)
+                    self._proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        except Exception:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        finally:
+            self._proc = None
+            self._launched_by_us = False
+
+
+class OneClickCalibThread(QtCore.QThread):
+    step_log = QtCore.pyqtSignal(str)
+    step_error = QtCore.pyqtSignal(str)
+    ready_to_collect = QtCore.pyqtSignal()
+    cleanup_done = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        check_lidar_fn: Callable[[], tuple[bool, str]],
+        driver_manager: LivoxDriverManager,
+        parent: QtCore.QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._check_lidar_fn = check_lidar_fn
+        self._driver_manager = driver_manager
+        self._running = True
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _topic_ready(self) -> bool:
+        try:
+            proc = subprocess.run(
+                ['ros2', 'topic', 'info', '/livox/imu'],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except Exception:
+            return False
+
+        if proc.returncode != 0:
+            return False
+
+        match = re.search(r'Publisher count:\s*(\d+)', proc.stdout)
+        return bool(match and int(match.group(1)) > 0)
+
+    def _is_livox_node_running(self) -> bool:
+        try:
+            proc = subprocess.run(
+                ['ros2', 'node', 'list'],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except Exception:
+            return False
+        if proc.returncode != 0:
+            return False
+        for line in proc.stdout.splitlines():
+            if 'livox' in line.lower():
+                return True
+        return False
+
+    def run(self) -> None:
+        launched_here = False
+        collect_ready = False
+        try:
+            if shutil.which('ros2') is None:
+                self.step_error.emit('未找到 ros2 命令，请先 source ROS2 环境')
+                return
+
+            self.step_log.emit('检测雷达连接...')
+            connected, ip = self._check_lidar_fn()
+            if not connected:
+                self.step_error.emit(f'雷达不可达: {ip}')
+                return
+            self.step_log.emit(f'检测雷达连接... {ip} ✓')
+
+            if not self._running:
+                return
+
+            if self._is_livox_node_running():
+                self.step_log.emit('检测到 Livox 驱动已在运行，跳过启动')
+            else:
+                self.step_log.emit('启动 Livox 驱动...')
+                if not self._driver_manager.launch():
+                    self.step_error.emit('启动 Livox 驱动失败')
+                    return
+                launched_here = True
+
+            self.step_log.emit('等待 IMU 数据... /livox/imu')
+            deadline = time.monotonic() + 15.0
+            while self._running and time.monotonic() < deadline:
+                if self._topic_ready():
+                    self.step_log.emit('IMU 数据已就绪')
+                    collect_ready = True
+                    self.ready_to_collect.emit()
+                    return
+                self.sleep(1)
+
+            if not self._running:
+                return
+
+            self.step_error.emit('等待 /livox/imu 超时（15s）')
+        finally:
+            if launched_here and (not collect_ready):
+                self._driver_manager.stop()
+                self.cleanup_done.emit()
+
+
+class GravityCalibTab(QtWidgets.QWidget):
+    SKIP_SAMPLES = 10
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.collector_thread: GravityCollectorThread | None = None
+        self.target_samples = 1000
+        self.collected_samples = 0
+        self.total_seen_samples = 0
+        self.mean_acc = np.zeros(3, dtype=np.float64)
+        self.m2_acc = np.zeros(3, dtype=np.float64)
+        self.latest_acc = np.zeros(3, dtype=np.float64)
+        self.final_gravity: np.ndarray | None = None
+        self.plot_points: collections.deque[tuple[float, float, float]] = collections.deque(maxlen=1200)
+        self.driver_manager = LivoxDriverManager()
+        self.one_click_thread: OneClickCalibThread | None = None
+        self._one_click_active = False
+        self._one_click_cleanup_pending = False
+        self._one_click_abort_requested = False
+        self._atexit_registered = False
+        self._build_ui()
+        self._set_idle_status()
+        self._reset_displays()
+        if not self._atexit_registered:
+            atexit.register(self._atexit_cleanup)
+            self._atexit_registered = True
+
+    def _build_ui(self) -> None:
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setSpacing(10)
+
+        one_click_layout = QtWidgets.QHBoxLayout()
+        self.detect_lidar_button = QtWidgets.QPushButton('检测雷达连接')
+        self.one_click_button = QtWidgets.QPushButton('一键标定')
+        self.one_click_stop_button = QtWidgets.QPushButton('停止')
+        self.one_click_stop_button.setEnabled(False)
+        one_click_layout.addWidget(self.detect_lidar_button)
+        one_click_layout.addWidget(self.one_click_button)
+        one_click_layout.addWidget(self.one_click_stop_button)
+        one_click_layout.addSpacing(12)
+        one_click_layout.addWidget(QtWidgets.QLabel('状态:'))
+        self.one_click_status_label = QtWidgets.QLabel('● 未检测')
+        self.one_click_status_label.setMinimumWidth(220)
+        one_click_layout.addWidget(self.one_click_status_label)
+        one_click_layout.addStretch(1)
+        main_layout.addLayout(one_click_layout)
+
+        self.one_click_log = QtWidgets.QTextEdit()
+        self.one_click_log.setReadOnly(True)
+        self.one_click_log.setMaximumHeight(110)
+        self.one_click_log.setPlaceholderText('一键标定日志...')
+        main_layout.addWidget(self.one_click_log)
+
+        top_bar = QtWidgets.QHBoxLayout()
+        top_bar.addWidget(QtWidgets.QLabel('IMU Topic'))
+        self.topic_edit = QtWidgets.QLineEdit('livox/imu')
+        self.topic_edit.setMinimumWidth(180)
+        top_bar.addWidget(self.topic_edit)
+
+        top_bar.addSpacing(12)
+        top_bar.addWidget(QtWidgets.QLabel('采样数'))
+        self.sample_spin = QtWidgets.QSpinBox()
+        self.sample_spin.setRange(100, 5000)
+        self.sample_spin.setValue(1000)
+        top_bar.addWidget(self.sample_spin)
+
+        top_bar.addSpacing(12)
+        self.collect_button = QtWidgets.QPushButton('开始采集')
+        top_bar.addWidget(self.collect_button)
+        top_bar.addStretch(1)
+        top_bar.addWidget(QtWidgets.QLabel('状态:'))
+        self.status_indicator = QtWidgets.QLabel('● 待机')
+        self.status_indicator.setMinimumWidth(140)
+        top_bar.addWidget(self.status_indicator)
+        main_layout.addLayout(top_bar)
+
+        self.collect_button.clicked.connect(self._toggle_collection)
+        self.detect_lidar_button.clicked.connect(self._on_detect_lidar_clicked)
+        self.one_click_button.clicked.connect(self._on_one_click_clicked)
+        self.one_click_stop_button.clicked.connect(self._on_one_click_stop_clicked)
+
+        self.realtime_section = CollapsibleSection('实时采集', self)
+        main_layout.addWidget(self.realtime_section)
+        self._build_realtime_section(self.realtime_section.content_layout)
+
+        self.result_section = CollapsibleSection('标定结果', self)
+        main_layout.addWidget(self.result_section)
+        self._build_result_section(self.result_section.content_layout)
+
+        self._set_section_expanded(self.realtime_section, True)
+        self._set_section_expanded(self.result_section, True)
+
+    def _set_section_expanded(self, section: CollapsibleSection, expanded: bool) -> None:
+        section.is_expanded = expanded
+        section.content_area.setVisible(expanded)
+        section.arrow_label.setText('▼' if expanded else '▶')
+
+    def _build_realtime_section(self, layout: QtWidgets.QGridLayout) -> None:
+        layout.setColumnStretch(0, 0)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(2, 1)
+        layout.setColumnStretch(3, 1)
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, self.sample_spin.value())
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat('%v / %m')
+        self.progress_bar.setStyleSheet(
+            'QProgressBar { background: #1f2438; border: 1px solid #3f4666; border-radius: 4px; color: #e5e7eb; text-align: center; }'
+            'QProgressBar::chunk { background: #4f8cff; border-radius: 3px; }'
+        )
+        layout.addWidget(QtWidgets.QLabel('采集进度'), 0, 0)
+        layout.addWidget(self.progress_bar, 0, 1, 1, 3)
+
+        self.cur_labels = self._make_vec_row(layout, 1, '当前加速度')
+        self.mean_labels = self._make_vec_row(layout, 2, '均值')
+        self.std_labels = self._make_vec_row(layout, 3, '标准差')
+
+        self.std_warning_label = QtWidgets.QLabel('')
+        self.std_warning_label.setStyleSheet('color: #ef4444; font-weight: 600;')
+        layout.addWidget(self.std_warning_label, 4, 0, 1, 4)
+
+        self.plot_figure = Figure(figsize=(7, 3.2), facecolor='#1a1d2e')
+        self.plot_canvas = FigureCanvasQTAgg(self.plot_figure)
+        self.plot_canvas.setMinimumHeight(260)
+        self.xy_ax = self.plot_figure.add_subplot(131)
+        self.yz_ax = self.plot_figure.add_subplot(132)
+        self.xz_ax = self.plot_figure.add_subplot(133)
+        self.plot_figure.subplots_adjust(left=0.06, right=0.98, bottom=0.16, top=0.92, wspace=0.32)
+        for ax in (self.xy_ax, self.yz_ax, self.xz_ax):
+            ax.set_facecolor('#1f2438')
+            ax.tick_params(colors='#cbd5e1', labelsize=8)
+            ax.grid(True, linestyle='--', alpha=0.25, color='#5a5f73')
+            for spine in ax.spines.values():
+                spine.set_color('#3f4666')
+        self.xy_ax.set_title('X-Y', color='#e5e7eb', fontsize=9)
+        self.yz_ax.set_title('Y-Z', color='#e5e7eb', fontsize=9)
+        self.xz_ax.set_title('X-Z', color='#e5e7eb', fontsize=9)
+        layout.addWidget(self.plot_canvas, 5, 0, 1, 4)
+
+    def _build_result_section(self, layout: QtWidgets.QGridLayout) -> None:
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(3, 1)
+
+        self.warning_label = QtWidgets.QLabel('⚠️ 采集时请确保机器人完全静止，放置在水平地面上')
+        self.warning_label.setStyleSheet('color: #fbbf24; font-weight: 600;')
+        layout.addWidget(self.warning_label, 0, 0, 1, 4)
+
+        layout.addWidget(QtWidgets.QLabel('acc_norm'), 1, 0)
+        self.acc_norm_combo = QtWidgets.QComboBox()
+        self.acc_norm_combo.addItem('1.0 (g)', 1.0)
+        self.acc_norm_combo.addItem('9.81 (m/s²)', 9.81)
+        self.acc_norm_combo.setCurrentIndex(0)
+        self.acc_norm_combo.currentIndexChanged.connect(self._update_result_view)
+        layout.addWidget(self.acc_norm_combo, 1, 1)
+
+        self.gravity_label = QtWidgets.QLabel('gravity: [--, --, --]')
+        self.gravity_label.setStyleSheet('color: #e5e7eb; font-family: monospace; font-size: 13px;')
+        layout.addWidget(self.gravity_label, 2, 0, 1, 4)
+
+        self.norm_label = QtWidgets.QLabel('norm: --')
+        self.norm_label.setStyleSheet('color: #94a3b8; font-weight: 600;')
+        layout.addWidget(self.norm_label, 3, 0, 1, 4)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.copy_yaml_button = QtWidgets.QPushButton('复制 YAML')
+        self.write_yaml_button = QtWidgets.QPushButton('写入配置')
+        btn_row.addWidget(self.copy_yaml_button)
+        btn_row.addWidget(self.write_yaml_button)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row, 4, 0, 1, 4)
+
+        self.copy_yaml_button.clicked.connect(self._copy_yaml)
+        self.write_yaml_button.clicked.connect(self._write_yaml)
+
+    def _make_vec_row(self, layout: QtWidgets.QGridLayout, row: int, title: str) -> dict[str, QtWidgets.QLabel]:
+        layout.addWidget(QtWidgets.QLabel(title), row, 0)
+        x_label = QtWidgets.QLabel('x: --')
+        y_label = QtWidgets.QLabel('y: --')
+        z_label = QtWidgets.QLabel('z: --')
+        for idx, lbl in enumerate([x_label, y_label, z_label], start=1):
+            lbl.setStyleSheet('color: #cbd5e1; font-family: monospace;')
+            layout.addWidget(lbl, row, idx)
+        return {'x': x_label, 'y': y_label, 'z': z_label}
+
+    def _toggle_collection(self) -> None:
+        if self.collector_thread is not None and self.collector_thread.isRunning():
+            self._stop_collection(user_initiated=True)
+        else:
+            self._start_collection()
+
+    def _timestamp(self) -> str:
+        return time.strftime('%H:%M:%S')
+
+    def _append_one_click_log(self, msg: str) -> None:
+        self.one_click_log.append(f'[{self._timestamp()}] {msg}')
+
+    def _set_one_click_status(self, text: str, color: str) -> None:
+        self.one_click_status_label.setText(text)
+        self.one_click_status_label.setStyleSheet(f'color: {color}; font-weight: 600;')
+
+    def _set_one_click_busy(self, busy: bool) -> None:
+        self.detect_lidar_button.setEnabled(not busy)
+        self.one_click_button.setEnabled(not busy)
+        self.one_click_stop_button.setEnabled(busy)
+
+    def _detect_lidar_ip(self) -> str:
+        for path in LIDAR_CONFIG_SEARCH_PATHS:
+            try:
+                if not path.exists():
+                    continue
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                lidar_configs = data.get('lidar_configs', [])
+                if isinstance(lidar_configs, list) and lidar_configs:
+                    first = lidar_configs[0]
+                    if isinstance(first, dict):
+                        ip = first.get('ip', '')
+                        if isinstance(ip, str) and ip.strip():
+                            return ip.strip()
+            except Exception:
+                continue
+        return DEFAULT_LIDAR_IP
+
+    def _check_lidar_connection(self) -> tuple[bool, str]:
+        lidar_ip = self._detect_lidar_ip()
+        try:
+            proc = subprocess.run(
+                ['ping', '-c', '1', '-W', '1', lidar_ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+            )
+            return proc.returncode == 0, lidar_ip
+        except Exception:
+            return False, lidar_ip
+
+    def _on_detect_lidar_clicked(self) -> None:
+        self._append_one_click_log('检测雷达连接...')
+        connected, ip = self._check_lidar_connection()
+        if connected:
+            self._append_one_click_log(f'检测雷达连接... {ip} ✓')
+            self._set_one_click_status(f'● 在线 ({ip})', '#34d399')
+        else:
+            self._append_one_click_log(f'检测雷达连接... {ip} ✗')
+            self._set_one_click_status(f'● 离线 ({ip})', '#ef4444')
+
+    def _on_one_click_clicked(self) -> None:
+        if self.collector_thread is not None and self.collector_thread.isRunning():
+            QtWidgets.QMessageBox.information(self, '采集中', '当前正在采集，请先停止当前任务。')
+            return
+        if self.one_click_thread is not None and self.one_click_thread.isRunning():
+            return
+
+        self._one_click_active = True
+        self._one_click_cleanup_pending = False
+        self._one_click_abort_requested = False
+        self._set_one_click_busy(True)
+        self._set_one_click_status('● 运行中', '#60a5fa')
+        self.one_click_thread = OneClickCalibThread(self._check_lidar_connection, self.driver_manager, self)
+        self.one_click_thread.step_log.connect(self._append_one_click_log)
+        self.one_click_thread.step_error.connect(self._on_one_click_error)
+        self.one_click_thread.ready_to_collect.connect(self._on_one_click_ready_to_collect)
+        self.one_click_thread.cleanup_done.connect(self._on_one_click_cleanup_done)
+        self.one_click_thread.finished.connect(self._on_one_click_thread_finished)
+        self.one_click_thread.start()
+
+    def _on_one_click_stop_clicked(self) -> None:
+        self._one_click_abort_requested = True
+        self._append_one_click_log('收到停止指令，正在终止流程...')
+        self._abort_one_click_flow()
+
+    @QtCore.pyqtSlot(str)
+    def _on_one_click_error(self, msg: str) -> None:
+        self._append_one_click_log(f'流程失败: {msg}')
+        self._set_one_click_status('● 错误', '#ef4444')
+        self._set_one_click_busy(False)
+        self._one_click_active = False
+        self._one_click_cleanup_pending = False
+        QtWidgets.QMessageBox.warning(self, '一键标定失败', msg)
+
+    @QtCore.pyqtSlot()
+    def _on_one_click_ready_to_collect(self) -> None:
+        if self._one_click_abort_requested:
+            self._abort_one_click_flow()
+            return
+        self.topic_edit.setText('livox/imu')
+        self._append_one_click_log(f'IMU 数据就绪，开始采集 ({int(self.sample_spin.value())} 样本)')
+        self._one_click_cleanup_pending = True
+        self._start_collection()
+
+    @QtCore.pyqtSlot()
+    def _on_one_click_cleanup_done(self) -> None:
+        self._append_one_click_log('已关闭 Livox 驱动')
+
+    @QtCore.pyqtSlot()
+    def _on_one_click_thread_finished(self) -> None:
+        self.one_click_thread = None
+        if not self._one_click_cleanup_pending:
+            self._set_one_click_busy(False)
+
+    def _abort_one_click_flow(self) -> None:
+        if self.one_click_thread is not None and self.one_click_thread.isRunning():
+            self.one_click_thread.stop()
+            self.one_click_thread.wait(1200)
+        if self.collector_thread is not None and self.collector_thread.isRunning():
+            self._stop_collection(user_initiated=True)
+        if self.driver_manager.launched_by_us:
+            self.driver_manager.stop()
+            self._append_one_click_log('已关闭 Livox 驱动')
+        self._one_click_active = False
+        self._one_click_cleanup_pending = False
+        self._set_one_click_busy(False)
+        self._set_one_click_status('● 已停止', '#94a3b8')
+
+    def _finalize_one_click_after_collection(self) -> None:
+        if not self._one_click_cleanup_pending:
+            return
+        if self.driver_manager.launched_by_us:
+            self._append_one_click_log('采集完成，关闭 Livox 驱动')
+            self.driver_manager.stop()
+        else:
+            self._append_one_click_log('采集完成，保留外部已运行的 Livox 驱动')
+        self._set_one_click_status('● 完成', '#34d399')
+        self._set_one_click_busy(False)
+        self._one_click_active = False
+        self._one_click_cleanup_pending = False
+
+    def _atexit_cleanup(self) -> None:
+        try:
+            if self.driver_manager.launched_by_us:
+                self.driver_manager.stop()
+        except Exception:
+            pass
+
+    def _start_collection(self) -> None:
+        topic = self.topic_edit.text().strip() or 'livox/imu'
+        self.target_samples = int(self.sample_spin.value())
+        self._reset_collection_state()
+
+        self.collector_thread = GravityCollectorThread(topic, self)
+        self.collector_thread.sample_received.connect(self._on_sample_received)
+        self.collector_thread.collection_error.connect(self._on_collection_error)
+        self.collector_thread.finished.connect(self._on_collector_finished)
+        self.collector_thread.start()
+
+        self.collect_button.setText('停止采集')
+        self.sample_spin.setEnabled(False)
+        self.topic_edit.setEnabled(False)
+        self._set_collecting_status()
+        self._show_status_message('重力标定采集已启动')
+
+    def _stop_collection(self, user_initiated: bool = False) -> None:
+        if self.collector_thread is not None:
+            self.collector_thread.stop()
+            self.collector_thread.wait(1200)
+        self._set_idle_status()
+        self.collect_button.setText('开始采集')
+        self.sample_spin.setEnabled(True)
+        self.topic_edit.setEnabled(True)
+        if user_initiated:
+            self._show_status_message('已停止采集')
+
+    @QtCore.pyqtSlot()
+    def _on_collector_finished(self) -> None:
+        self.collector_thread = None
+        self.collect_button.setText('开始采集')
+        self.sample_spin.setEnabled(True)
+        self.topic_edit.setEnabled(True)
+        if self.status_indicator.text() == '● 采集中':
+            self._set_idle_status()
+        self._finalize_one_click_after_collection()
+
+    @QtCore.pyqtSlot(float, float, float)
+    def _on_sample_received(self, acc_x: float, acc_y: float, acc_z: float) -> None:
+        self.total_seen_samples += 1
+        self.latest_acc[:] = [acc_x, acc_y, acc_z]
+        self._update_vec_labels(self.cur_labels, self.latest_acc)
+
+        if self.total_seen_samples <= self.SKIP_SAMPLES:
+            return
+
+        self.collected_samples += 1
+        sample = np.array([acc_x, acc_y, acc_z], dtype=np.float64)
+        delta = sample - self.mean_acc
+        self.mean_acc += delta / self.collected_samples
+        delta2 = sample - self.mean_acc
+        self.m2_acc += delta * delta2
+
+        std = self._current_std()
+        self._update_vec_labels(self.mean_labels, self.mean_acc)
+        self._update_vec_labels(self.std_labels, std)
+        self._update_std_warning(std)
+
+        self.progress_bar.setValue(self.collected_samples)
+        self.progress_bar.setFormat(f'{self.collected_samples} / {self.target_samples}')
+
+        self.plot_points.append((acc_x, acc_y, acc_z))
+        if self.collected_samples % 10 == 0 or self.collected_samples == self.target_samples:
+            self._refresh_plot()
+
+        self.final_gravity = self.mean_acc.copy()
+        self._update_result_view()
+
+        if self.collected_samples >= self.target_samples:
+            self._stop_collection(user_initiated=False)
+            self._show_status_message('重力标定采集完成')
+
+    @QtCore.pyqtSlot(str)
+    def _on_collection_error(self, msg: str) -> None:
+        self._stop_collection(user_initiated=False)
+        self._set_error_status(msg)
+        QtWidgets.QMessageBox.warning(self, '采集失败', msg)
+
+    def _reset_collection_state(self) -> None:
+        self.collected_samples = 0
+        self.total_seen_samples = 0
+        self.mean_acc[:] = 0.0
+        self.m2_acc[:] = 0.0
+        self.latest_acc[:] = 0.0
+        self.final_gravity = None
+        self.plot_points.clear()
+        self.progress_bar.setRange(0, self.target_samples)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(f'0 / {self.target_samples}')
+        self._reset_displays()
+        self._refresh_plot()
+
+    def _reset_displays(self) -> None:
+        self._update_vec_labels(self.cur_labels, None)
+        self._update_vec_labels(self.mean_labels, None)
+        self._update_vec_labels(self.std_labels, None)
+        self.std_warning_label.setText('')
+        self.gravity_label.setText('gravity: [--, --, --]')
+        self.norm_label.setText('norm: --')
+        self.norm_label.setStyleSheet('color: #94a3b8; font-weight: 600;')
+
+    def _update_vec_labels(self, labels: dict[str, QtWidgets.QLabel], vec: np.ndarray | None) -> None:
+        if vec is None:
+            labels['x'].setText('x: --')
+            labels['y'].setText('y: --')
+            labels['z'].setText('z: --')
+            return
+        labels['x'].setText(f'x: {vec[0]: .6f}')
+        labels['y'].setText(f'y: {vec[1]: .6f}')
+        labels['z'].setText(f'z: {vec[2]: .6f}')
+
+    def _current_std(self) -> np.ndarray:
+        if self.collected_samples < 2:
+            return np.zeros(3, dtype=np.float64)
+        var = self.m2_acc / (self.collected_samples - 1)
+        var = np.maximum(var, 0.0)
+        return np.sqrt(var)
+
+    def _update_std_warning(self, std: np.ndarray) -> None:
+        if np.any(std > 0.05):
+            self.std_warning_label.setText('标准差过大，请确保机器人静止')
+        else:
+            self.std_warning_label.setText('')
+
+    def _refresh_plot(self) -> None:
+        for ax in (self.xy_ax, self.yz_ax, self.xz_ax):
+            ax.cla()
+            ax.set_facecolor('#1f2438')
+            ax.tick_params(colors='#cbd5e1', labelsize=8)
+            ax.grid(True, linestyle='--', alpha=0.25, color='#5a5f73')
+            for spine in ax.spines.values():
+                spine.set_color('#3f4666')
+
+        self.xy_ax.set_title('X-Y', color='#e5e7eb', fontsize=9)
+        self.yz_ax.set_title('Y-Z', color='#e5e7eb', fontsize=9)
+        self.xz_ax.set_title('X-Z', color='#e5e7eb', fontsize=9)
+        self.xy_ax.set_xlabel('X', color='#94a3b8', fontsize=8)
+        self.xy_ax.set_ylabel('Y', color='#94a3b8', fontsize=8)
+        self.yz_ax.set_xlabel('Y', color='#94a3b8', fontsize=8)
+        self.yz_ax.set_ylabel('Z', color='#94a3b8', fontsize=8)
+        self.xz_ax.set_xlabel('X', color='#94a3b8', fontsize=8)
+        self.xz_ax.set_ylabel('Z', color='#94a3b8', fontsize=8)
+
+        if self.plot_points:
+            points = np.array(self.plot_points, dtype=np.float64)
+            self.xy_ax.scatter(points[:, 0], points[:, 1], s=8, color='#4f8cff', alpha=0.65)
+            self.yz_ax.scatter(points[:, 1], points[:, 2], s=8, color='#34d399', alpha=0.65)
+            self.xz_ax.scatter(points[:, 0], points[:, 2], s=8, color='#fbbf24', alpha=0.65)
+
+        self.plot_canvas.draw_idle()
+
+    def _update_result_view(self) -> None:
+        if self.final_gravity is None:
+            self.gravity_label.setText('gravity: [--, --, --]')
+            self.norm_label.setText('norm: --')
+            self.norm_label.setStyleSheet('color: #94a3b8; font-weight: 600;')
+            return
+
+        g = self.final_gravity
+        self.gravity_label.setText(f'gravity: [{g[0]:.9f}, {g[1]:.9f}, {g[2]:.9f}]')
+        norm = float(np.linalg.norm(g))
+        expected_norm = float(self.acc_norm_combo.currentData())
+        diff = abs(norm - expected_norm)
+        if diff <= expected_norm * 0.03:
+            color = '#34d399'
+        elif diff <= expected_norm * 0.08:
+            color = '#fbbf24'
+        else:
+            color = '#ef4444'
+        self.norm_label.setText(f'norm: {norm:.3f} (expected ~ {expected_norm:.2f})')
+        self.norm_label.setStyleSheet(f'color: {color}; font-weight: 700;')
+
+    def _format_yaml_text(self, g: np.ndarray) -> str:
+        return (
+            f'gravity: [{g[0]:.9f}, {g[1]:.9f}, {g[2]:.9f}]\n'
+            f'gravity_init: [{g[0]:.9f}, {g[1]:.9f}, {g[2]:.9f}]'
+        )
+
+    def _copy_yaml(self) -> None:
+        if self.final_gravity is None:
+            QtWidgets.QMessageBox.information(self, '无可复制数据', '请先完成采集后再复制 YAML。')
+            return
+        text = self._format_yaml_text(self.final_gravity)
+        QtWidgets.QApplication.clipboard().setText(text)
+        self._show_status_message('已复制 gravity YAML 到剪贴板')
+
+    def _write_yaml(self) -> None:
+        if self.final_gravity is None:
+            QtWidgets.QMessageBox.information(self, '无可写入数据', '请先完成采集后再写入配置。')
+            return
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            '选择 nav2_params.yaml',
+            str(pathlib.Path.cwd()),
+            'YAML Files (*.yaml *.yml)',
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            updated = self._replace_mapping_gravity(lines, self.final_gravity)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.writelines(updated)
+            self._show_status_message(f'已写入重力参数: {file_path}')
+            QtWidgets.QMessageBox.information(self, '写入成功', f'已更新文件:\n{file_path}')
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, '写入失败', f'更新 YAML 失败:\n{exc}')
+
+    def _replace_mapping_gravity(self, lines: list[str], gravity: np.ndarray) -> list[str]:
+        mapping_idx = None
+        mapping_indent = 0
+        for i, line in enumerate(lines):
+            m = re.match(r'^(\s*)mapping\s*:\s*(#.*)?$', line)
+            if m:
+                mapping_idx = i
+                mapping_indent = len(m.group(1))
+                break
+        if mapping_idx is None:
+            raise ValueError('未找到 mapping: 段落')
+
+        section_end = len(lines)
+        for i in range(mapping_idx + 1, len(lines)):
+            stripped = lines[i].strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            current_indent = len(lines[i]) - len(lines[i].lstrip(' '))
+            if current_indent <= mapping_indent:
+                section_end = i
+                break
+
+        gravity_line = f'gravity: [{gravity[0]:.9f}, {gravity[1]:.9f}, {gravity[2]:.9f}]\n'
+        gravity_init_line = f'gravity_init: [{gravity[0]:.9f}, {gravity[1]:.9f}, {gravity[2]:.9f}]\n'
+
+        field_indent = ' ' * (mapping_indent + 2)
+        gravity_replaced = False
+        gravity_init_replaced = False
+        for i in range(mapping_idx + 1, section_end):
+            if re.match(r'^\s*gravity_init\s*:', lines[i]):
+                lines[i] = f'{field_indent}{gravity_init_line}'
+                gravity_init_replaced = True
+            elif re.match(r'^\s*gravity\s*:', lines[i]):
+                lines[i] = f'{field_indent}{gravity_line}'
+                gravity_replaced = True
+
+        insert_idx = section_end
+        if not gravity_replaced:
+            lines.insert(insert_idx, f'{field_indent}{gravity_line}')
+            insert_idx += 1
+            section_end += 1
+        if not gravity_init_replaced:
+            lines.insert(insert_idx, f'{field_indent}{gravity_init_line}')
+
+        return lines
+
+    def _set_collecting_status(self) -> None:
+        self.status_indicator.setText('● 采集中')
+        self.status_indicator.setStyleSheet('color: #34d399; font-weight: 600;')
+
+    def _set_idle_status(self) -> None:
+        self.status_indicator.setText('● 待机')
+        self.status_indicator.setStyleSheet('color: #94a3b8; font-weight: 600;')
+
+    def _set_error_status(self, msg: str) -> None:
+        self.status_indicator.setText('● 错误')
+        self.status_indicator.setStyleSheet('color: #ef4444; font-weight: 600;')
+        self._show_status_message(msg)
+
+    def _show_status_message(self, msg: str) -> None:
+        if self.window() and isinstance(self.window(), QtWidgets.QMainWindow):
+            self.window().statusBar().showMessage(msg, 3000)
+
+    def shutdown(self) -> None:
+        if self.one_click_thread is not None and self.one_click_thread.isRunning():
+            self.one_click_thread.stop()
+            self.one_click_thread.wait(1200)
+        self._stop_collection(user_initiated=False)
+        if self.driver_manager.launched_by_us:
+            self.driver_manager.stop()
+
+
 class SentryToolboxWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2080,11 +2976,13 @@ class SentryToolboxWindow(QtWidgets.QMainWindow):
         self.map_tab = MapPickerTab(self)
         self.connectivity_tab = ConnectivityTab(self)
         self.diag_tab = SerialDiagTab(self)
+        self.gravity_tab = GravityCalibTab(self)
 
         self.tabs.addTab(self.serial_tab, '串口 Mock')
         self.tabs.addTab(self.map_tab, '地图坐标拾取')
         self.tabs.addTab(self.connectivity_tab, '连通性检测')
         self.tabs.addTab(self.diag_tab, '串口诊断')
+        self.tabs.addTab(self.gravity_tab, '重力标定')
 
         self.status_label = QtWidgets.QLabel('Ready')
         self.statusBar().addPermanentWidget(self.status_label, 1)
@@ -2093,6 +2991,7 @@ class SentryToolboxWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.serial_tab.shutdown()
         self.diag_tab.shutdown()
+        self.gravity_tab.shutdown()
         super().closeEvent(event)
 
     def _apply_dark_theme(self) -> None:
