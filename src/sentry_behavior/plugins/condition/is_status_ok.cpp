@@ -27,8 +27,8 @@ BT::NodeStatus IsStatusOKCondition::checkRobotStatus()
   int hp_min, heat_max, ammo_min;
   auto msg = getInput<rm_interfaces::msg::RobotStatus>("key_port");
   if (!msg) {
-    return BT::NodeStatus::FAILURE;
     RCLCPP_ERROR(logger_, "RobotStatus message is not available");
+    return BT::NodeStatus::FAILURE;
   }
 
   getInput("hp_min", hp_min);

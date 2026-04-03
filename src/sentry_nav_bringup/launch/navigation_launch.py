@@ -317,6 +317,9 @@ def generate_launch_description():
                 plugin="nav2_bt_navigator::BtNavigator",
                 name="bt_navigator",
                 parameters=[configured_params],
+                remappings=[
+                    ("cmd_vel", "cmd_vel_nav2_result"),
+                ],
             ),
             ComposableNode(
                 package="nav2_waypoint_follower",

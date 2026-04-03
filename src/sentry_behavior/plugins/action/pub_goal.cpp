@@ -41,7 +41,7 @@ bool PubGoalAction::setMessage(geometry_msgs::msg::PoseStamped & msg)
     msg.pose.orientation.x=0;
     msg.pose.orientation.y=0;
     msg.pose.orientation.z=0;
-    msg.pose.orientation.w=0;
+    msg.pose.orientation.w=1.0;
     //msg.header.stamp = now();
     //msg.header.frame_id = "map";
     //msg.pose = goal->pose;

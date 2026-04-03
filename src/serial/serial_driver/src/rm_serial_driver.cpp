@@ -253,17 +253,17 @@ void RMSerialDriver::getParams()
 void RMSerialDriver::reopenPort()
 {
   RCLCPP_WARN(get_logger(), "Attempting to reopen port");
-  try {
-    if (serial_driver_->port()->is_open()) {
-      serial_driver_->port()->close();
-    }
-    serial_driver_->port()->open();
-    RCLCPP_INFO(get_logger(), "Successfully reopened port");
-  } catch (const std::exception & ex) {
-    RCLCPP_ERROR(get_logger(), "Error while reopening port: %s", ex.what());
-    if (rclcpp::ok()) {
+  while (rclcpp::ok()) {
+    try {
+      if (serial_driver_->port()->is_open()) {
+        serial_driver_->port()->close();
+      }
+      serial_driver_->port()->open();
+      RCLCPP_INFO(get_logger(), "Successfully reopened port");
+      return;
+    } catch (const std::exception & ex) {
+      RCLCPP_ERROR(get_logger(), "Error while reopening port: %s", ex.what());
       rclcpp::sleep_for(std::chrono::seconds(1));
-      reopenPort();
     }
   }
 }

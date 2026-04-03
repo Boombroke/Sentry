@@ -32,8 +32,8 @@ bool PursuitBTNode::setMessage(geometry_msgs::msg::PoseStamped & goal)
   }
   auto msg = getInput<auto_aim_interfaces::msg::Target>("key_port");
   if (!msg) {
-    return false;
     RCLCPP_ERROR(node_->get_logger(), "allRobotHP message is not available");
+    return false;
   } 
   auto target=msg.value();
   target_.position.x= target.position.x;
@@ -53,12 +53,10 @@ bool PursuitBTNode::setMessage(geometry_msgs::msg::PoseStamped & goal)
 
 void PursuitBTNode::calculatePursuitPose(const auto_aim_interfaces::msg::Target & target_)
 {
-  double enemy_x = robot_pose_.pose.position.x+target_.position.x;
-  double enemy_y = robot_pose_.pose.position.y+target_.position.y;
   double self_x = robot_pose_.pose.position.x;
   double self_y = robot_pose_.pose.position.y;
-  robot_pose_.pose.position.x+=target_.position.x;
-  robot_pose_.pose.position.y+=target_.position.y;
+  double enemy_x = self_x + target_.position.x;
+  double enemy_y = self_y + target_.position.y;
 
   
   double dx = self_x - enemy_x;

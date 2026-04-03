@@ -29,8 +29,8 @@ BT::NodeStatus IsRfidDetectedCondition::checkRfidStatus()
     friendly_supply_zone_exchange, center_gain_point;
   auto msg = getInput<rm_interfaces::msg::RfidStatus>("key_port");
   if (!msg) {
-    return BT::NodeStatus::FAILURE;
     RCLCPP_ERROR(logger_, "RfidStatus message is not available");
+    return BT::NodeStatus::FAILURE;
   }
 
   getInput("friendly_fortress_gain_point", friendly_fortress_gain_point);
