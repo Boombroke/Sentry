@@ -196,6 +196,17 @@ protected:
    */
   bool isCollisionDetected(const nav_msgs::msg::Path & path);
 
+  /**
+   * @brief Checks if the straight line from robot to a target point passes through lethal obstacles.
+   * Uses Bresenham-style ray casting on the costmap grid.
+   * @param target_x Target x in costmap global frame
+   * @param target_y Target y in costmap global frame
+   * @param costmap Pointer to the costmap
+   * @return True if the direct path is blocked by a lethal obstacle
+   */
+  bool isDirectPathBlocked(
+    double target_x, double target_y, nav2_costmap_2d::Costmap2D * costmap) const;
+
 private:
   /**
    * @brief Applies curvature based speed limitation

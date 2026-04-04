@@ -244,6 +244,33 @@ geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityComman
 
   double lin_dist = hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y);
 
+  // Check if direct line from robot to lookahead is blocked by a lethal obstacle.
+  // If blocked (e.g. at a U-turn), fall back to path tangent direction to avoid
+  // driving straight through the obstacle.
+  bool direct_path_blocked = false;
+  {
+    geometry_msgs::msg::PoseStamped carrot_in_costmap_frame;
+    if (transformPose(costmap_ros_->getGlobalFrameID(), carrot_pose, carrot_in_costmap_frame)) {
+      std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> costmap_lock(
+        *(costmap->getMutex()));
+      direct_path_blocked = isDirectPathBlocked(
+        carrot_in_costmap_frame.pose.position.x,
+        carrot_in_costmap_frame.pose.position.y,
+        costmap);
+    }
+  }
+
+  if (direct_path_blocked && transformed_plan.poses.size() >= 2) {
+    const auto & p0 = transformed_plan.poses[0].pose.position;
+    const auto & p1 = transformed_plan.poses[std::min(
+      static_cast<size_t>(1), transformed_plan.poses.size() - 1)].pose.position;
+    double tangent_angle = atan2(p1.y - p0.y, p1.x - p0.x);
+    theta_dist = tangent_angle;
+    RCLCPP_DEBUG_THROTTLE(
+      logger_, *clock_, 500,
+      "Direct path to lookahead blocked, using path tangent direction (%.2f rad)", theta_dist);
+  }
+
   if (use_rotate_to_heading_) {
     angle_to_goal = tf2::getYaw(transformed_plan.poses.back().pose.orientation);
     if (fabs(angle_to_goal) > use_rotate_to_heading_treshold_) {
@@ -258,53 +285,44 @@ geometry_msgs::msg::TwistStamped OmniPidPursuitController::computeVelocityComman
 
   applyApproachVelocityScaling(transformed_plan, lin_vel);
 
-  // Ensure minimum velocity to prevent "Failed to make progress"
-  // This is a final safety check after all velocity limitations
   double absolute_min_vel = std::max(min_approach_linear_velocity_, v_linear_max_ * 0.05);
-  if (lin_dist > 0.01) {  // Only enforce minimum if we have a valid path
+  if (lin_dist > 0.01) {
     lin_vel = std::max(lin_vel, absolute_min_vel);
   }
 
-  // Prepare command velocity
   geometry_msgs::msg::TwistStamped cmd_vel;
   cmd_vel.header = pose.header;
   cmd_vel.twist.linear.x = lin_vel * cos(theta_dist);
   cmd_vel.twist.linear.y = lin_vel * sin(theta_dist);
   cmd_vel.twist.angular.z = angular_vel;
 
-  // Collision checking - acquire lock only when needed
-  // Reduce sample points for better performance (from 10 to 5)
-  nav_msgs::msg::Path costmap_frame_local_plan;
-  int sample_points = 5;  // Reduced from 10 for better performance
-  int plan_size = transformed_plan.poses.size();
+  int plan_size = static_cast<int>(transformed_plan.poses.size());
   if (plan_size > 0) {
-    // Sample fewer points: start, middle, and end
     std::vector<size_t> sample_indices;
     if (plan_size <= 3) {
-      // If path is short, check all points
-      for (size_t i = 0; i < plan_size; ++i) {
+      for (size_t i = 0; i < static_cast<size_t>(plan_size); ++i) {
         sample_indices.push_back(i);
       }
     } else {
-      // Sample start, middle, and end points
-      sample_indices.push_back(0);
-      sample_indices.push_back(plan_size / 2);
-      sample_indices.push_back(plan_size - 1);
-    }
-
-    std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
-    for (size_t idx : sample_indices) {
-      geometry_msgs::msg::PoseStamped map_pose;
-      if (transformPose(costmap_ros_->getGlobalFrameID(), transformed_plan.poses[idx], map_pose)) {
-        costmap_frame_local_plan.poses.push_back(map_pose);
+      for (int k = 0; k < 5; ++k) {
+        sample_indices.push_back(
+          static_cast<size_t>(k * (plan_size - 1) / 4));
       }
     }
-    lock.unlock();
 
-    // Check collision outside the lock
+    nav_msgs::msg::Path costmap_frame_local_plan;
+    {
+      std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
+      for (size_t idx : sample_indices) {
+        geometry_msgs::msg::PoseStamped map_pose;
+        if (transformPose(
+              costmap_ros_->getGlobalFrameID(), transformed_plan.poses[idx], map_pose)) {
+          costmap_frame_local_plan.poses.push_back(map_pose);
+        }
+      }
+    }
+
     if (isCollisionDetected(costmap_frame_local_plan)) {
-      // Instead of throwing exception, return zero velocity and log warning
-      // This allows the controller to continue trying instead of aborting
       RCLCPP_WARN_THROTTLE(
         logger_, *clock_, 1000,
         "Collision detected in the trajectory. Stopping the robot!");
@@ -408,28 +426,48 @@ std::unique_ptr<geometry_msgs::msg::PointStamped> OmniPidPursuitController::crea
 geometry_msgs::msg::PoseStamped OmniPidPursuitController::getLookAheadPoint(
   const double & lookahead_dist, const nav_msgs::msg::Path & transformed_plan)
 {
-  // Find the first pose which is at a distance greater than the lookahead distance
-  auto goal_pose_it = std::find_if(
-    transformed_plan.poses.begin(), transformed_plan.poses.end(), [&](const auto & ps) {
-      return hypot(ps.pose.position.x, ps.pose.position.y) >= lookahead_dist;
-    });
+  // Use path (arc-length) distance instead of Euclidean distance to select the lookahead point.
+  // This prevents the lookahead from "jumping" across a U-turn to the return leg when the
+  // Euclidean distance is small but the path distance is large.
+  double cumulative_dist = 0.0;
+  auto goal_pose_it = transformed_plan.poses.begin();
 
-  // If the no pose is not far enough, take the last pose
-  if (goal_pose_it == transformed_plan.poses.end()) {
+  for (auto it = std::next(transformed_plan.poses.begin()); it != transformed_plan.poses.end();
+       ++it) {
+    auto prev_it = std::prev(it);
+    cumulative_dist += hypot(
+      it->pose.position.x - prev_it->pose.position.x,
+      it->pose.position.y - prev_it->pose.position.y);
+    if (cumulative_dist >= lookahead_dist) {
+      goal_pose_it = it;
+      break;
+    }
+  }
+
+  // If no pose is far enough along the path, take the last pose
+  if (cumulative_dist < lookahead_dist) {
     goal_pose_it = std::prev(transformed_plan.poses.end());
   } else if (use_interpolation_ && goal_pose_it != transformed_plan.poses.begin()) {
-    // Find the point on the line segment between the two poses
-    // that is exactly the lookahead distance away from the robot pose (the origin)
-    // This can be found with a closed form for the intersection of a segment and a circle
-    // Because of the way we did the std::find_if, prev_pose is guaranteed to be inside the circle,
-    // and goal_pose is guaranteed to be outside the circle.
+    // Interpolate between the two poses straddling the lookahead distance along the path
     auto prev_pose_it = std::prev(goal_pose_it);
-    auto point = circleSegmentIntersection(
-      prev_pose_it->pose.position, goal_pose_it->pose.position, lookahead_dist);
+    double seg_len = hypot(
+      goal_pose_it->pose.position.x - prev_pose_it->pose.position.x,
+      goal_pose_it->pose.position.y - prev_pose_it->pose.position.y);
+    double overshoot = cumulative_dist - lookahead_dist;
+    double ratio = (seg_len > 1e-6) ? (1.0 - overshoot / seg_len) : 1.0;
+    ratio = std::clamp(ratio, 0.0, 1.0);
+
     geometry_msgs::msg::PoseStamped pose;
     pose.header.frame_id = prev_pose_it->header.frame_id;
     pose.header.stamp = goal_pose_it->header.stamp;
-    pose.pose.position = point;
+    pose.pose.position.x =
+      prev_pose_it->pose.position.x +
+      ratio * (goal_pose_it->pose.position.x - prev_pose_it->pose.position.x);
+    pose.pose.position.y =
+      prev_pose_it->pose.position.y +
+      ratio * (goal_pose_it->pose.position.y - prev_pose_it->pose.position.y);
+    pose.pose.position.z = 0.0;
+    pose.pose.orientation = goal_pose_it->pose.orientation;
     return pose;
   }
 
@@ -504,12 +542,53 @@ bool OmniPidPursuitController::isCollisionDetected(const nav_msgs::msg::Path & p
         return true;
       }
     } else {
-      // RCLCPP_WARN(
-      //   logger_,
-      //   "The Local path is not in the costmap. Cannot check for collisions. "
-      //   "Proceed at your own risk, slow the robot, or increase your costmap size.");
       return false;
     }
+  }
+  return false;
+}
+
+bool OmniPidPursuitController::isDirectPathBlocked(
+  double target_x, double target_y, nav2_costmap_2d::Costmap2D * costmap) const
+{
+  unsigned int mx0, my0, mx1, my1;
+  double robot_x = costmap->getOriginX() + costmap->getSizeInMetersX() / 2.0;
+  double robot_y = costmap->getOriginY() + costmap->getSizeInMetersY() / 2.0;
+
+  geometry_msgs::msg::PoseStamped robot_pose;
+  if (costmap_ros_->getRobotPose(robot_pose)) {
+    robot_x = robot_pose.pose.position.x;
+    robot_y = robot_pose.pose.position.y;
+  }
+
+  if (!costmap->worldToMap(robot_x, robot_y, mx0, my0) ||
+      !costmap->worldToMap(target_x, target_y, mx1, my1)) {
+    return false;
+  }
+
+  // Bresenham line stepping
+  int dx = static_cast<int>(mx1) - static_cast<int>(mx0);
+  int dy = static_cast<int>(my1) - static_cast<int>(my0);
+  int steps = std::max(std::abs(dx), std::abs(dy));
+  if (steps == 0) {
+    return false;
+  }
+
+  double x_inc = static_cast<double>(dx) / steps;
+  double y_inc = static_cast<double>(dy) / steps;
+  double cx = static_cast<double>(mx0);
+  double cy = static_cast<double>(my0);
+
+  for (int i = 0; i <= steps; ++i) {
+    unsigned int grid_x = static_cast<unsigned int>(std::round(cx));
+    unsigned int grid_y = static_cast<unsigned int>(std::round(cy));
+    if (grid_x < costmap->getSizeInCellsX() && grid_y < costmap->getSizeInCellsY()) {
+      if (costmap->getCost(grid_x, grid_y) >= nav2_costmap_2d::LETHAL_OBSTACLE) {
+        return true;
+      }
+    }
+    cx += x_inc;
+    cy += y_inc;
   }
   return false;
 }
