@@ -34,6 +34,7 @@ double scanVoxelSize = 0.1;
 double decayTime = 10.0;
 double noDecayDis = 0;
 double clearingDis = 30.0;
+double configuredClearingDis = 30.0;
 bool clearingCloud = false;
 bool useSorting = false;
 double quantileZ = 0.25;
@@ -196,6 +197,7 @@ int main(int argc, char **argv) {
   nh->get_parameter("decayTime", decayTime);
   nh->get_parameter("noDecayDis", noDecayDis);
   nh->get_parameter("clearingDis", clearingDis);
+  configuredClearingDis = clearingDis;
   nh->get_parameter("useSorting", useSorting);
   nh->get_parameter("quantileZ", quantileZ);
   nh->get_parameter("vehicleHeight", vehicleHeight);
@@ -553,6 +555,7 @@ int main(int argc, char **argv) {
       }
 
       clearingCloud = false;
+      clearingDis = configuredClearingDis;
 
       // publish points with elevation
       sensor_msgs::msg::PointCloud2 terrainCloud2;

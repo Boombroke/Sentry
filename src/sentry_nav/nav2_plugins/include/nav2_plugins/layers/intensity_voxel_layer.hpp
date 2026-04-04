@@ -52,7 +52,7 @@ public:
   bool isDiscretized() { return true; }
   virtual void matchSize();
   virtual void reset();
-  virtual bool isClearable() { return false; }
+  virtual bool isClearable() { return true; }
 
 protected:
   virtual void resetMaps();
