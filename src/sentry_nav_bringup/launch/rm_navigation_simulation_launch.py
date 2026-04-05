@@ -44,6 +44,7 @@ def generate_launch_description():
     use_respawn = LaunchConfiguration("use_respawn")
     rviz_config_file = LaunchConfiguration("rviz_config_file")
     use_rviz = LaunchConfiguration("use_rviz")
+    use_foxglove = LaunchConfiguration("use_foxglove")
 
     configured_params = ParameterFile(
         RewrittenYaml(
@@ -136,6 +137,12 @@ def generate_launch_description():
         "use_rviz", default_value="True", description="Whether to start RVIZ"
     )
 
+    declare_use_foxglove_cmd = DeclareLaunchArgument(
+        "use_foxglove",
+        default_value="False",
+        description="Whether to start foxglove_bridge for remote web visualization",
+    )
+
     start_velodyne_convert_tool = Node(
         package="ign_sim_pointcloud_tool",
         executable="ign_sim_pointcloud_tool_node",
@@ -143,6 +150,22 @@ def generate_launch_description():
         output="screen",
         namespace=namespace,
         parameters=[configured_params],
+    )
+
+    foxglove_bridge_cmd = Node(
+        package="foxglove_bridge",
+        executable="foxglove_bridge",
+        name="foxglove_bridge",
+        output="screen",
+        namespace=namespace,
+        parameters=[
+            {"port": 8765},
+            {"address": "0.0.0.0"},
+            {"use_sim_time": use_sim_time},
+            {"capabilities": ["clientPublish", "parameters", "parametersSubscribe",
+                              "services", "connectionGraph", "assets"]},
+        ],
+        condition=IfCondition(use_foxglove),
     )
 
     rviz_cmd = IncludeLaunchDescription(
@@ -193,6 +216,7 @@ def generate_launch_description():
     ld.add_action(declare_use_composition_cmd)
     ld.add_action(declare_rviz_config_file_cmd)
     ld.add_action(declare_use_rviz_cmd)
+    ld.add_action(declare_use_foxglove_cmd)
     ld.add_action(declare_use_respawn_cmd)
 
     # Add the actions to launch all of the navigation nodes
@@ -200,5 +224,6 @@ def generate_launch_description():
     ld.add_action(bringup_cmd)
     ld.add_action(joy_teleop_cmd)
     ld.add_action(rviz_cmd)
+    ld.add_action(foxglove_bridge_cmd)
 
     return ld
