@@ -91,7 +91,7 @@ ros2 launch serial_driver serial_driver.launch.py device_name:=/dev/pts/4
 | 分组 | 检测内容 | 状态 |
 |---|---|---|
 | 串口设备 | `/dev/ttyACM*`, `/dev/ttyUSB*` | ✅ 存在 / ❌ 无设备 |
-| 关键节点 | serial_driver, controller_server, planner_server, bt_navigator, behavior_server, loam_interface 等 | ✅ 运行中 / ❌ 未检测到 |
+| 关键节点 | serial_driver, controller_server, planner_server, bt_navigator, behavior_server, odom_bridge 等 | ✅ 运行中 / ❌ 未检测到 |
 | Topic 状态 | gimbal_joint_state, cmd_vel, odometry, obstacle_scan, terrain_map, referee/* | ✅ 有发布者 / ⚠️ 频率低 / ❌ 无发布者 |
 | TF 链路 | map→odom, odom→chassis, chassis→gimbal_yaw | ✅ 正常 / ❌ 断开 |
 
@@ -245,7 +245,7 @@ python3 src/sentry_tools/serial_visualizer.py
 |---|---|
 | `cmd_vel_nav2_result` | 导航命令速度（world 系，fake_vel_transform 之前，无自旋） |
 | `cmd_vel` | 最终下发速度（body 系 + spin_speed，fake_vel_transform 之后） |
-| `odometry` | 实际速度（world 系，sensor_scan_generation 位置差分） |
+| `odometry` | 实际速度（world 系，odom_bridge 位置差分） |
 | `serial/gimbal_joint_state` | 云台关节状态 |
 | `referee/game_status` | 比赛阶段 + 倒计时 |
 | `referee/robot_status` | 血量 + 弹量 |

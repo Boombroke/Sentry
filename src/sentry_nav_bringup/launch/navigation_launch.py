@@ -140,19 +140,9 @@ def generate_launch_description():
         condition=IfCondition(PythonExpression(["not ", use_composition])),
         actions=[
             Node(
-                package="loam_interface",
-                executable="loam_interface_node",
-                name="loam_interface",
-                output="screen",
-                respawn=use_respawn,
-                respawn_delay=2.0,
-                parameters=[configured_params],
-                arguments=["--ros-args", "--log-level", log_level],
-            ),
-            Node(
-                package="sensor_scan_generation",
-                executable="sensor_scan_generation_node",
-                name="sensor_scan_generation",
+                package="odom_bridge",
+                executable="odom_bridge_node",
+                name="odom_bridge",
                 output="screen",
                 respawn=use_respawn,
                 respawn_delay=2.0,
@@ -267,15 +257,9 @@ def generate_launch_description():
         target_container=container_name_full,
         composable_node_descriptions=[
             ComposableNode(
-                package="loam_interface",
-                plugin="loam_interface::LoamInterfaceNode",
-                name="loam_interface",
-                parameters=[configured_params],
-            ),
-            ComposableNode(
-                package="sensor_scan_generation",
-                plugin="sensor_scan_generation::SensorScanGenerationNode",
-                name="sensor_scan_generation",
+                package="odom_bridge",
+                plugin="odom_bridge::OdomBridgeNode",
+                name="odom_bridge",
                 parameters=[configured_params],
             ),
             ComposableNode(

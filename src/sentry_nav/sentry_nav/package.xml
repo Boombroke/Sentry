@@ -12,8 +12,7 @@
   <!-- pb25_nav_bringup doesn't belong for recursive dependencies -->
   <depend>fake_vel_transform</depend>
   <depend>ign_sim_pointcloud_tool</depend>
-  <depend>loam_interface</depend>
-  <depend>sensor_scan_generation</depend>
+  <depend>odom_bridge</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

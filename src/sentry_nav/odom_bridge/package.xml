@@ -1,14 +1,14 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>loam_interface</name>
-  <version>1.3.1</version>
-  <description>Loam Interface</description>
+  <name>odom_bridge</name>
+  <version>1.0.0</version>
+  <description>Merge loam_interface and sensor_scan_generation into one composable odom bridge node.</description>
   <maintainer email="lihanchen2004@163.com">Lihan Chen</maintainer>
   <license>Apache-2.0</license>
-  <author email="lihanchen2004@163.com">Lihan Chen</author>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>ament_cmake_auto</build_depend>
 
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
@@ -18,6 +18,9 @@
   <depend>nav_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>pcl_ros</depend>
+  <depend>message_filters</depend>
+  <depend>pcl_conversions</depend>
+  <depend>std_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

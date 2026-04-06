@@ -429,7 +429,7 @@ ros2 launch location map_visualizer_launch.py
 | 模块 | 启动命令 |
 |:---|:---|
 | Point-LIO 里程计 | `ros2 launch point_lio point_lio.launch.py` |
-| LOAM 坐标转换 | `ros2 launch loam_interface loam_interface_launch.py` |
+| 里程计桥接 | 已集成到 navigation_launch.py 中 (odom_bridge composable node) |
 | GICP 重定位 | `ros2 launch small_gicp_relocalization small_gicp_relocalization_launch.py` |
 | Livox 驱动 | `ros2 launch livox_ros_driver2 msg_MID360_launch.py` |
 | 速度变换 | `ros2 launch fake_vel_transform fake_vel_transform_launch.py` |
@@ -561,7 +561,7 @@ ros2 launch location map_visualizer_launch.py
 | `mapping.lidar_meas_cov` | `0.001` | `0.01` | LiDAR 测量协方差 |
 | `filter_size_surf` | `0.2` | `0.2` | 表面特征降采样步长 (m) |
 | `filter_size_map` | `0.2` | `0.2` | 地图降采样步长 (m) |
-| `publish.tf_send_en` | `False` | `False` | TF 发布（禁用，由 loam_interface 处理） |
+| `publish.tf_send_en` | `False` | `False` | TF 发布（禁用，由 odom_bridge 处理） |
 | `pcd_save.pcd_save_en` | `False` | `False` | 退出时保存 PCD（SLAM 模式自动设为 True） |
 
 > **调参警告**：`gravity` 向量必须精确匹配 LiDAR 的物理安装角度。仿真中 LiDAR 倾斜约 30° (`rpy=[0, pi/6, 0]`)，故重力分量为 `[0, -4.9, -8.49]`。实车需通过实际标定获得。错误的重力向量会导致里程计快速发散。
