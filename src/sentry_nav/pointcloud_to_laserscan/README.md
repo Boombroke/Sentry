@@ -11,6 +11,8 @@ This ROS 2 component projects `sensor_msgs/msg/PointCloud2` messages into `senso
 
 * `scan` (`sensor_msgs/msg/LaserScan`) - The output laser scan.
 
+> **注意**: `scan` 话题使用 RELIABLE QoS（而非默认的 BEST_EFFORT），以兼容 slam_toolbox 等要求 RELIABLE 的下游订阅者。
+
 ### Subscribed Topics
 
 * `cloud_in` (`sensor_msgs/msg/PointCloud2`) - The input point cloud. No input will be processed if there isn't at least one subscriber to the `scan` topic.

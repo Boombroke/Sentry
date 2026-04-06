@@ -6,12 +6,13 @@
 节点直接订阅 Point-LIO 的原始里程计和注册点云，在一次同步回调中完成：
 
 1. `lidar_odom -> odom` 变换
-2. `odom -> chassis(base_frame)` 2D 约束
+2. `odom -> chassis(base_frame)` 2D 约束（z=0, roll=0, pitch=0）
 3. `odom -> robot_base_frame` 里程计发布（含位置差分速度）
-4. 点云转换并发布 `sensor_scan`
-5. TF 广播 `odom -> base_frame`
+4. 点云转换并发布 `sensor_scan`（lidar 系）
+5. 发布 `registered_scan`（odom 系点云）和 `lidar_odometry`（odom 系里程计），供 terrain_analysis/ext 使用
+6. TF 广播 `odom -> base_frame`
 
-相较旧链路，去除了中间话题 `lidar_odometry` / `registered_scan` 和额外一次同步步骤，减少一次发布-订阅 hop。
+相较旧链路，去除了独立的 loam_interface / sensor_scan_generation 节点和额外一次同步步骤，减少一次发布-订阅 hop。`registered_scan` 和 `lidar_odometry` 话题保留以兼容下游 terrain_analysis/ext。
 
 ## 订阅话题
 
@@ -22,8 +23,10 @@
 
 ## 发布话题
 
-- `sensor_scan` (`sensor_msgs/msg/PointCloud2`)
-- `odometry` (`nav_msgs/msg/Odometry`)
+- `sensor_scan` (`sensor_msgs/msg/PointCloud2`，lidar 系)
+- `odometry` (`nav_msgs/msg/Odometry`，odom -> robot_base_frame，含位置差分速度)
+- `registered_scan` (`sensor_msgs/msg/PointCloud2`，odom 系点云，供 terrain_analysis/ext)
+- `lidar_odometry` (`nav_msgs/msg/Odometry`，odom -> lidar_frame，供 terrain_analysis/ext)
 
 ## TF 发布
 

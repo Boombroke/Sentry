@@ -10,8 +10,10 @@
 
 ## 话题
 ### 订阅
-- `sensor_scan` (sensor_msgs/PointCloud2): chassis系下的点云。
-- `odometry` (nav_msgs/Odometry): 机器人里程计。
+- `registered_scan` (sensor_msgs/PointCloud2): odom 系点云（来自 odom_bridge）。
+- `lidar_odometry` (nav_msgs/Odometry): odom 系里程计（来自 odom_bridge）。
+- `joy` (sensor_msgs/Joy): 手柄输入。
+- `map_clearing` (std_msgs/Float32): 地图清除触发。
 
 ### 发布
 - `terrain_map` (sensor_msgs/PointCloud2): 标注了地形可通行性的点云地图。
