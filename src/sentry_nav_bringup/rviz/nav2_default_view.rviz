@@ -23,6 +23,24 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 50
+      Reference Frame: map
+      Value: true
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: false
@@ -304,7 +322,7 @@ Visualization Manager:
         Value: obstacle_scan
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
     - Alpha: 0.20000000298023224
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -458,11 +476,11 @@ Visualization Manager:
             Reliability Policy: Reliable
             Value: global_costmap/published_footprint
           Value: false
-      Enabled: true
+      Enabled: false
       Name: Global Planner
     - Class: rviz_common/Group
       Displays:
-        - Alpha: 0.699999988079071
+        - Alpha: 0.30000001192092896
           Class: rviz_default_plugins/Map
           Color Scheme: costmap
           Draw Behind: false
