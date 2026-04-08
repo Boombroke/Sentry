@@ -64,10 +64,10 @@ sudo make install
 
 ### 3.2 创建工作空间
 ```bash
-mkdir -p ~/ros_ws/src
-cd ~/ros_ws
-# 将本项目复制到 src/ 目录
-cp -r <path_to_sentry_nav>/src/* src/
+mkdir -p ~/sentry_ws/src
+cd ~/sentry_ws
+# 将本项目的 src/ 内容链接到工作空间
+ln -sf <path_to_sentry>/src/* src/
 ```
 
 ### 3.3 安装 ROS 依赖
@@ -114,6 +114,12 @@ ros2 launch sentry_nav_bringup rm_multi_navigation_simulation_launch.py world:=r
 ```
 
 ## 5. 实车模式
+
+### 5.0 一键启动（推荐）
+```bash
+ros2 launch sentry_nav_bringup rm_sentry_launch.py
+```
+该脚本自动启动串口驱动、Point-LIO、导航栈和行为树，无需手动逐个启动。
 
 ### 5.1 建图
 ```bash

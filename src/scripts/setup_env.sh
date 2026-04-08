@@ -101,6 +101,12 @@ install_system_deps() {
         ros-humble-joy
 
     ok "系统依赖安装完成"
+
+    info "安装 Python 工具依赖..."
+    pip3 install --quiet pyserial jinja2 2>/dev/null || \
+        sudo apt install -y python3-serial python3-jinja2
+
+    ok "Python 工具依赖安装完成"
 }
 
 # ---------- 4. 安装 small_gicp ----------
@@ -165,11 +171,11 @@ build_workspace() {
         info "已创建工作空间: $WS_DIR"
     fi
 
-    # 链接/复制源码
+    # 链接/复制源码（PROJECT_DIR 即为 src/ 目录，直接链接其中的包）
     if [ ! -d "$WS_DIR/src/sentry_nav_bringup" ]; then
         info "将源码链接到工作空间..."
-        ln -sf "$PROJECT_DIR/src/"* "$WS_DIR/src/" 2>/dev/null || \
-            cp -rs "$PROJECT_DIR/src/"* "$WS_DIR/src/"
+        ln -sf "$PROJECT_DIR/"* "$WS_DIR/src/" 2>/dev/null || \
+            cp -rs "$PROJECT_DIR/"* "$WS_DIR/src/"
     fi
 
     # 安装 ROS 依赖

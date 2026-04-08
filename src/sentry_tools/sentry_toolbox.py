@@ -24,6 +24,7 @@ import serial.tools.list_ports
 import yaml
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle as MplRect
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from protocol import (
@@ -777,32 +778,125 @@ class SerialMockTab(QtWidgets.QWidget):
 
 
 class MapPickerTab(QtWidgets.QWidget):
+    """Map coordinate picker + PGM map editor.
+
+    Modes:
+    - 'pick': Original coordinate picking (left-click places markers).
+    - 'brush': Draw occupied pixels (black, value 0).
+    - 'eraser': Draw free pixels (white, value 254).
+    - 'unknown': Draw unknown pixels (gray, value 128).
+    - 'line': Draw a straight line (click start, click end).
+    - 'rect': Draw a filled rectangle (click corner, click opposite corner).
+    """
+
+    # Pixel values for the trinary map semantics (negate=0)
+    PX_OCCUPIED: int = 0
+    PX_FREE: int = 254
+    PX_UNKNOWN: int = 128
+    _UNDO_LIMIT: int = 50
+
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
+        # --- Map state ---
         self.map_image: np.ndarray | None = None
         self.resolution: float | None = None
         self.origin: list[float] | None = None
         self.map_extent: list[float] | None = None
+        self.yaml_path = ''
+        self._image_path = ''
+        self._has_unsaved_changes = False
+
+        # --- Pick mode state ---
         self.marked_points: list[tuple[float, float]] = []
         self.marker_artists: list[object] = []
-        self.yaml_path = ''
+
+        # --- Edit mode state ---
+        self._mode: str = 'pick'
+        self._brush_radius: int = 3
+        self._is_drawing: bool = False
+        self._last_draw_px: tuple[int, int] | None = None
+        self._shape_start_world: tuple[float, float] | None = None
+        self._preview_artists: list[object] = []
+
+        # --- Undo / redo ---
+        self._undo_stack: list[np.ndarray] = []
+        self._redo_stack: list[np.ndarray] = []
 
         self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI Construction
+    # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         main_layout = QtWidgets.QVBoxLayout(self)
 
+        # --- Row 1: file operations ---
         top_layout = QtWidgets.QHBoxLayout()
         self.select_map_button = QtWidgets.QPushButton('选择地图')
         self.clear_mark_button = QtWidgets.QPushButton('清除标记')
+        self.save_button = QtWidgets.QPushButton('保存')
+        self.save_as_button = QtWidgets.QPushButton('另存为')
         self.map_path_label = QtWidgets.QLabel('地图文件: 未选择')
         self.map_path_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
         top_layout.addWidget(self.select_map_button)
         top_layout.addWidget(self.clear_mark_button)
+        top_layout.addWidget(self.save_button)
+        top_layout.addWidget(self.save_as_button)
         top_layout.addWidget(self.map_path_label, stretch=1)
         main_layout.addLayout(top_layout)
 
+        # --- Row 2: edit toolbar ---
+        edit_bar = QtWidgets.QHBoxLayout()
+
+        # Mode toggle button group (exclusive)
+        self._mode_group = QtWidgets.QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        mode_defs = [
+            ('pick', '拾取'),
+            ('brush', '障碍物'),
+            ('eraser', '自由空间'),
+            ('unknown', '未知区域'),
+            ('line', '直线'),
+            ('rect', '矩形'),
+        ]
+        for mode_id, label in mode_defs:
+            btn = QtWidgets.QPushButton(label)
+            btn.setCheckable(True)
+            btn.setProperty('mode_id', mode_id)
+            if mode_id == 'pick':
+                btn.setChecked(True)
+            self._mode_group.addButton(btn)
+            edit_bar.addWidget(btn)
+
+        edit_bar.addSpacing(16)
+
+        # Brush size control
+        edit_bar.addWidget(QtWidgets.QLabel('笔刷:'))
+        self._brush_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._brush_slider.setRange(1, 20)
+        self._brush_slider.setValue(self._brush_radius)
+        self._brush_slider.setFixedWidth(120)
+        self._brush_label = QtWidgets.QLabel(f'{self._brush_radius}px')
+        self._brush_label.setFixedWidth(32)
+        edit_bar.addWidget(self._brush_slider)
+        edit_bar.addWidget(self._brush_label)
+
+        edit_bar.addSpacing(16)
+
+        # Undo / redo
+        self.undo_button = QtWidgets.QPushButton('撤销')
+        self.redo_button = QtWidgets.QPushButton('重做')
+        self.undo_button.setShortcut(QtGui.QKeySequence('Ctrl+Z'))
+        self.redo_button.setShortcut(QtGui.QKeySequence('Ctrl+Y'))
+        edit_bar.addWidget(self.undo_button)
+        edit_bar.addWidget(self.redo_button)
+        edit_bar.addStretch()
+
+        main_layout.addLayout(edit_bar)
+
+        # --- Row 3: canvas + right panel ---
         content_layout = QtWidgets.QHBoxLayout()
 
         self.figure = Figure(facecolor='#1e1e2e')
@@ -832,13 +926,357 @@ class MapPickerTab(QtWidgets.QWidget):
 
         main_layout.addLayout(content_layout, stretch=1)
 
+        # --- Signals ---
         self.select_map_button.clicked.connect(self.select_map_file)
         self.clear_mark_button.clicked.connect(self.clear_markers)
+        self.save_button.clicked.connect(self._save_map)
+        self.save_as_button.clicked.connect(self._save_map_as)
         self.copy_selected_button.clicked.connect(self.copy_selected_coordinate)
         self.clear_list_button.clicked.connect(self.clear_markers)
-        self.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+        self._mode_group.buttonClicked.connect(self._on_mode_changed)
+        self._brush_slider.valueChanged.connect(self._on_brush_size_changed)
+        self.undo_button.clicked.connect(self._undo)
+        self.redo_button.clicked.connect(self._redo)
+
+        # Matplotlib events
+        self._cid_press = self.canvas.mpl_connect('button_press_event', self._on_canvas_press)
+        self._cid_release = self.canvas.mpl_connect('button_release_event', self._on_canvas_release)
+        self._cid_motion = self.canvas.mpl_connect('motion_notify_event', self._on_canvas_motion)
 
         self._draw_empty_hint()
+        self._update_edit_ui_state()
+
+    # ------------------------------------------------------------------
+    # Mode switching
+    # ------------------------------------------------------------------
+
+    def _on_mode_changed(self, btn: QtWidgets.QPushButton) -> None:
+        self._mode = btn.property('mode_id')
+        self._cancel_shape_preview()
+        self._update_edit_ui_state()
+
+    def _update_edit_ui_state(self) -> None:
+        """Enable/disable toolbar widgets based on current mode."""
+        is_edit = self._mode != 'pick'
+        self._brush_slider.setEnabled(is_edit)
+        self.undo_button.setEnabled(is_edit and len(self._undo_stack) > 0)
+        self.redo_button.setEnabled(is_edit and len(self._redo_stack) > 0)
+        has_map = self.map_image is not None
+        self.save_button.setEnabled(has_map and self._has_unsaved_changes)
+        self.save_as_button.setEnabled(has_map)
+        # Disable matplotlib toolbar pan/zoom in edit modes to avoid conflicts
+        if is_edit:
+            self.toolbar.home()
+            if self.toolbar.mode:
+                # Deactivate any active nav tool (pan/zoom)
+                for action in self.toolbar.actions():
+                    if action.isChecked():
+                        action.trigger()
+
+    def _on_brush_size_changed(self, value: int) -> None:
+        self._brush_radius = value
+        self._brush_label.setText(f'{value}px')
+
+    # ------------------------------------------------------------------
+    # Coordinate conversion
+    # ------------------------------------------------------------------
+
+    def _world_to_pixel(self, wx: float, wy: float) -> tuple[int, int]:
+        """Convert world coordinates (meters) to pixel row, col in map_image."""
+        assert self.origin is not None and self.resolution is not None and self.map_image is not None
+        col = int(round((wx - self.origin[0]) / self.resolution))
+        row = int(round((wy - self.origin[1]) / self.resolution))
+        # map_image row 0 = top of image = highest Y in world
+        row = self.map_image.shape[0] - 1 - row
+        return row, col
+
+    def _pixel_to_world(self, row: int, col: int) -> tuple[float, float]:
+        """Convert pixel row, col to world coordinates (meters)."""
+        assert self.origin is not None and self.resolution is not None and self.map_image is not None
+        wx = self.origin[0] + col * self.resolution
+        wy = self.origin[1] + (self.map_image.shape[0] - 1 - row) * self.resolution
+        return wx, wy
+
+    # ------------------------------------------------------------------
+    # Drawing primitives — operate directly on self.map_image
+    # ------------------------------------------------------------------
+
+    def _paint_circle(self, row: int, col: int, radius: int, value: int) -> None:
+        """Paint a filled circle of *radius* pixels centered at (row, col)."""
+        assert self.map_image is not None
+        h, w = self.map_image.shape
+        r_min = max(0, row - radius)
+        r_max = min(h, row + radius + 1)
+        c_min = max(0, col - radius)
+        c_max = min(w, col + radius + 1)
+        for r in range(r_min, r_max):
+            for c in range(c_min, c_max):
+                if (r - row) ** 2 + (c - col) ** 2 <= radius ** 2:
+                    self.map_image[r, c] = value
+
+    def _paint_line_pixels(self, r0: int, c0: int, r1: int, c1: int, radius: int, value: int) -> None:
+        """Bresenham line with a circular brush at each step."""
+        dr = abs(r1 - r0)
+        dc = abs(c1 - c0)
+        sr = 1 if r0 < r1 else -1
+        sc = 1 if c0 < c1 else -1
+        err = dc - dr
+        while True:
+            self._paint_circle(r0, c0, radius, value)
+            if r0 == r1 and c0 == c1:
+                break
+            e2 = 2 * err
+            if e2 > -dr:
+                err -= dr
+                c0 += sc
+            if e2 < dc:
+                err += dc
+                r0 += sr
+
+    def _paint_rect_pixels(self, r0: int, c0: int, r1: int, c1: int, value: int) -> None:
+        """Fill a rectangle defined by two corner pixels."""
+        assert self.map_image is not None
+        h, w = self.map_image.shape
+        rr0, rr1 = min(r0, r1), max(r0, r1)
+        cc0, cc1 = min(c0, c1), max(c0, c1)
+        rr0 = max(0, rr0)
+        rr1 = min(h - 1, rr1)
+        cc0 = max(0, cc0)
+        cc1 = min(w - 1, cc1)
+        self.map_image[rr0:rr1 + 1, cc0:cc1 + 1] = value
+
+    def _current_paint_value(self) -> int:
+        """Return pixel value for the current drawing mode."""
+        if self._mode in ('brush', 'line', 'rect'):
+            return self.PX_OCCUPIED
+        elif self._mode == 'eraser':
+            return self.PX_FREE
+        elif self._mode == 'unknown':
+            return self.PX_UNKNOWN
+        return self.PX_OCCUPIED
+
+    # ------------------------------------------------------------------
+    # Undo / redo
+    # ------------------------------------------------------------------
+
+    def _push_undo(self) -> None:
+        """Snapshot current map_image onto the undo stack."""
+        if self.map_image is None:
+            return
+        self._undo_stack.append(self.map_image.copy())
+        if len(self._undo_stack) > self._UNDO_LIMIT:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _undo(self) -> None:
+        if not self._undo_stack or self.map_image is None:
+            return
+        self._redo_stack.append(self.map_image.copy())
+        self.map_image = self._undo_stack.pop()
+        self._has_unsaved_changes = True
+        self._redraw_base_map()
+        self._update_edit_ui_state()
+
+    def _redo(self) -> None:
+        if not self._redo_stack or self.map_image is None:
+            return
+        self._undo_stack.append(self.map_image.copy())
+        self.map_image = self._redo_stack.pop()
+        self._has_unsaved_changes = True
+        self._redraw_base_map()
+        self._update_edit_ui_state()
+
+    # ------------------------------------------------------------------
+    # Canvas event dispatching
+    # ------------------------------------------------------------------
+
+    def _on_canvas_press(self, event) -> None:
+        if self.map_image is None:
+            return
+        if event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        if event.button == 3 and self._shape_start_world is not None:
+            self._cancel_shape_preview()
+            self._set_status('已取消')
+            return
+
+        if event.button != 1:
+            return
+
+        if self._mode == 'pick':
+            self._pick_point(event)
+        elif self._mode in ('brush', 'eraser', 'unknown'):
+            self._begin_freehand(event)
+        elif self._mode in ('line', 'rect'):
+            self._handle_shape_click(event)
+
+    def _on_canvas_release(self, event) -> None:
+        if self._is_drawing:
+            self._end_freehand()
+
+    def _on_canvas_motion(self, event) -> None:
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        if self._is_drawing:
+            self._continue_freehand(event)
+        elif self._shape_start_world is not None and self._mode in ('line', 'rect'):
+            self._update_shape_preview(event)
+
+    # ------------------------------------------------------------------
+    # Pick mode (unchanged behavior)
+    # ------------------------------------------------------------------
+
+    def _pick_point(self, event) -> None:
+        x = float(event.xdata)
+        y = float(event.ydata)
+        self.marked_points.append((x, y))
+        self.coord_list.addItem(f'({x:.2f}, {y:.2f})')
+        scatter = self.ax.scatter(x, y, c='#34d399', marker='x')
+        text = self.ax.text(x, y, f'({x:.2f},{y:.2f})', color='#34d399', fontsize=8, ha='left', va='bottom')
+        self.marker_artists.extend([scatter, text])
+        self.canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # Freehand drawing (brush / eraser / unknown)
+    # ------------------------------------------------------------------
+
+    def _begin_freehand(self, event) -> None:
+        self._push_undo()
+        self._is_drawing = True
+        row, col = self._world_to_pixel(float(event.xdata), float(event.ydata))
+        self._paint_circle(row, col, self._brush_radius, self._current_paint_value())
+        self._last_draw_px = (row, col)
+        self._refresh_image_fast()
+
+    def _continue_freehand(self, event) -> None:
+        if self.map_image is None:
+            return
+        row, col = self._world_to_pixel(float(event.xdata), float(event.ydata))
+        if self._last_draw_px is not None:
+            self._paint_line_pixels(
+                self._last_draw_px[0], self._last_draw_px[1],
+                row, col, self._brush_radius, self._current_paint_value(),
+            )
+        else:
+            self._paint_circle(row, col, self._brush_radius, self._current_paint_value())
+        self._last_draw_px = (row, col)
+        self._refresh_image_fast()
+
+    def _end_freehand(self) -> None:
+        self._is_drawing = False
+        self._last_draw_px = None
+        self._has_unsaved_changes = True
+        self._update_edit_ui_state()
+
+    # ------------------------------------------------------------------
+    # Shape tools (line / rect) — click-click interaction
+    # ------------------------------------------------------------------
+
+    def _handle_shape_click(self, event) -> None:
+        wx, wy = float(event.xdata), float(event.ydata)
+        if self._shape_start_world is None:
+            # First click: set start point
+            self._shape_start_world = (wx, wy)
+            self._set_status(f'{"直线" if self._mode == "line" else "矩形"}: 点击第二个端点确认, 右键取消')
+        else:
+            # Second click: commit the shape
+            self._push_undo()
+            sx, sy = self._shape_start_world
+            r0, c0 = self._world_to_pixel(sx, sy)
+            r1, c1 = self._world_to_pixel(wx, wy)
+            value = self._current_paint_value()
+            if self._mode == 'line':
+                self._paint_line_pixels(r0, c0, r1, c1, self._brush_radius, value)
+            else:
+                self._paint_rect_pixels(r0, c0, r1, c1, value)
+            self._shape_start_world = None
+            self._cancel_shape_preview()
+            self._has_unsaved_changes = True
+            self._redraw_base_map()
+            self._update_edit_ui_state()
+
+    def _update_shape_preview(self, event) -> None:
+        """Draw a temporary preview line/rect on the canvas."""
+        if self._shape_start_world is None:
+            return
+        self._clear_preview_artists()
+        sx, sy = self._shape_start_world
+        ex, ey = float(event.xdata), float(event.ydata)
+        if self._mode == 'line':
+            line, = self.ax.plot([sx, ex], [sy, ey], color='#ef4444', linewidth=1.5, linestyle='--')
+            self._preview_artists.append(line)
+        elif self._mode == 'rect':
+            x0, y0 = min(sx, ex), min(sy, ey)
+            w, h = abs(ex - sx), abs(ey - sy)
+            patch = MplRect((x0, y0), w, h, linewidth=1.5, edgecolor='#ef4444', facecolor='none', linestyle='--')
+            self.ax.add_patch(patch)
+            self._preview_artists.append(patch)
+        self.canvas.draw_idle()
+
+    def _clear_preview_artists(self) -> None:
+        for a in self._preview_artists:
+            a.remove()
+        self._preview_artists.clear()
+
+    def _cancel_shape_preview(self) -> None:
+        self._clear_preview_artists()
+        self._shape_start_world = None
+        self.canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # Fast image refresh (update imshow data without full redraw)
+    # ------------------------------------------------------------------
+
+    def _refresh_image_fast(self) -> None:
+        """Update only the image data — avoids full redraw during drag painting."""
+        if self.map_image is None:
+            return
+        for img_artist in self.ax.images:
+            img_artist.set_data(np.flipud(self.map_image))
+            break
+        self.canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # Save / Save-as
+    # ------------------------------------------------------------------
+
+    def _save_map(self) -> None:
+        if self.map_image is None or not self._image_path:
+            return
+        self._write_pgm(self._image_path)
+        self._has_unsaved_changes = False
+        self._update_edit_ui_state()
+        self._set_status(f'已保存: {self._image_path}')
+
+    def _save_map_as(self) -> None:
+        if self.map_image is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, '另存为 PGM', self._image_path or '', 'PGM Files (*.pgm);;All Files (*)',
+        )
+        if not path:
+            return
+        if not path.lower().endswith('.pgm'):
+            path += '.pgm'
+        self._write_pgm(path)
+        self._set_status(f'已另存为: {path}')
+
+    def _write_pgm(self, path: str) -> None:
+        """Write self.map_image as P5 (binary) PGM."""
+        assert self.map_image is not None
+        img = self.map_image.astype(np.uint8)
+        h, w = img.shape
+        header = f'P5\n{w} {h}\n255\n'.encode('ascii')
+        with open(path, 'wb') as f:
+            f.write(header)
+            f.write(img.tobytes())
+
+    # ------------------------------------------------------------------
+    # Axes style / drawing helpers (unchanged)
+    # ------------------------------------------------------------------
 
     def _apply_axes_style(self) -> None:
         self.ax.set_facecolor('#1e1e2e')
@@ -859,12 +1297,25 @@ class MapPickerTab(QtWidgets.QWidget):
         self.ax.grid(True, linestyle='--', alpha=0.3, color='#5a5f73')
         self.canvas.draw_idle()
 
+    def _set_status(self, msg: str) -> None:
+        win = self.window()
+        if win and isinstance(win, QtWidgets.QMainWindow):
+            win.statusBar().showMessage(msg, 3000)
+
+    # ------------------------------------------------------------------
+    # Map loading (preserved interface)
+    # ------------------------------------------------------------------
+
     def select_map_file(self) -> None:
+        if self._has_unsaved_changes:
+            reply = QtWidgets.QMessageBox.question(
+                self, '未保存的更改', '当前地图有未保存的编辑，是否放弃？',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
         yaml_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            '选择地图 YAML',
-            '',
-            'YAML Files (*.yaml *.yml);;All Files (*)',
+            self, '选择地图 YAML', '', 'YAML Files (*.yaml *.yml);;All Files (*)',
         )
         if not yaml_path:
             return
@@ -885,14 +1336,19 @@ class MapPickerTab(QtWidgets.QWidget):
             if not isinstance(origin, list) or len(origin) < 2:
                 raise ValueError('origin 字段格式错误')
 
-            self.map_image = np.array(image)
+            self.map_image = np.array(image, dtype=np.uint8)
             self.resolution = resolution
             self.origin = origin
             self.yaml_path = yaml_path
+            self._image_path = image_path
             self.map_path_label.setText(f'地图文件: {yaml_path}')
 
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self._has_unsaved_changes = False
             self.clear_markers()
             self._redraw_base_map()
+            self._update_edit_ui_state()
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, '地图加载失败', f'无法加载地图:\n{exc}')
 
@@ -911,7 +1367,8 @@ class MapPickerTab(QtWidgets.QWidget):
 
         self.ax.clear()
         self._apply_axes_style()
-        self.ax.imshow(np.flipud(self.map_image), cmap='gray', origin='lower', extent=self.map_extent)
+        self.ax.imshow(np.flipud(self.map_image), cmap='gray', origin='lower', extent=self.map_extent,
+                       vmin=0, vmax=255)
         self.ax.quiver(self.origin[0], self.origin[1], 1, 0, scale=5, color='red', label='X-axis')
         self.ax.quiver(self.origin[0], self.origin[1], 0, 1, scale=5, color='blue', label='Y-axis')
         self.ax.scatter(0, 0, c='red', marker='o', label='Origin')
@@ -919,11 +1376,11 @@ class MapPickerTab(QtWidgets.QWidget):
         self.ax.set_xlabel('X (meters)')
         self.ax.set_ylabel('Y (meters)')
         self.ax.set_title('Map Visualization')
-        
+
         legend = self.ax.legend(facecolor='#1f2438', edgecolor='#3f4666')
         for text in legend.get_texts():
             text.set_color('#d0d0d0')
-            
+
         self.ax.grid(True, linestyle='--', alpha=0.3, color='#5a5f73')
 
         self.marker_artists.clear()
@@ -934,21 +1391,12 @@ class MapPickerTab(QtWidgets.QWidget):
 
         self.canvas.draw_idle()
 
+    # ------------------------------------------------------------------
+    # Pick-mode helpers (unchanged interface)
+    # ------------------------------------------------------------------
+
     def on_canvas_click(self, event) -> None:
-        if self.map_image is None:
-            return
-        if event.inaxes != self.ax or event.button != 1 or event.xdata is None or event.ydata is None:
-            return
-
-        x = float(event.xdata)
-        y = float(event.ydata)
-        self.marked_points.append((x, y))
-        self.coord_list.addItem(f'({x:.2f}, {y:.2f})')
-
-        scatter = self.ax.scatter(x, y, c='#34d399', marker='x')
-        text = self.ax.text(x, y, f'({x:.2f},{y:.2f})', color='#34d399', fontsize=8, ha='left', va='bottom')
-        self.marker_artists.extend([scatter, text])
-        self.canvas.draw_idle()
+        """Legacy compatibility — not used; dispatched via _on_canvas_press."""
 
     def clear_markers(self) -> None:
         self.marked_points.clear()
@@ -961,8 +1409,7 @@ class MapPickerTab(QtWidgets.QWidget):
         if item is None:
             return
         QtWidgets.QApplication.clipboard().setText(item.text())
-        if self.window() and isinstance(self.window(), QtWidgets.QMainWindow):
-            self.window().statusBar().showMessage(f'已复制坐标: {item.text()}', 2000)
+        self._set_status(f'已复制坐标: {item.text()}')
 
 
 class CheckWorker(QtCore.QThread):
@@ -2978,7 +3425,7 @@ class SentryToolboxWindow(QtWidgets.QMainWindow):
         self.gravity_tab = GravityCalibTab(self)
 
         self.tabs.addTab(self.serial_tab, '串口 Mock')
-        self.tabs.addTab(self.map_tab, '地图坐标拾取')
+        self.tabs.addTab(self.map_tab, '地图拾取与编辑')
         self.tabs.addTab(self.connectivity_tab, '连通性检测')
         self.tabs.addTab(self.diag_tab, '串口诊断')
         self.tabs.addTab(self.gravity_tab, '重力标定')
