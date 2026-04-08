@@ -128,32 +128,32 @@ terrain_analysis:
     minDyObsPointNum: 1
     noDataObstacle: False               # treat no data as obstacle
     noDataBlockSkipNum: 0
-    minBlockPointNum: 10
+    minBlockPointNum: 5                  # 体素内最少点数（原 10，低矮/薄障碍物容易漏检）
     vehicleHeight: 0.55                  # 小于车辆高度的点才会进行处理
     voxelPointUpdateThre: 100
     voxelTimeUpdateThre: 0.5
     minRelZ: -1.5                       # min_rel_z 以及 max_rel_z 限制了有效点云点的Z值范围，用于对天花板和地板进行处理
-    maxRelZ: 0.5
-    disRatioZ: 0.2                      # Z 值的最大最小范围由这两个值决定，但是并不等于这两个值，是有一个比例关系的，距离机器人越远，限定范围就越大，这其中考虑了坡度
+    maxRelZ: 0.3                        # 收紧上界（原 0.5），配合 disRatioZ 减少远处天花板
+    disRatioZ: 0.1                      # 降低远处高度放宽比例（原 0.2），抑制远处天花板点
 
 terrain_analysis_ext:
   ros__parameters:
     scanVoxelSize: 0.1
-    decayTime: 0.2
+    decayTime: 1.0                      # 点云衰减时间（原 0.2 太短，1.0 兼顾动态响应和自旋覆盖）
     noDecayDis: 0.0
-    clearingDis: 20.0
+    clearingDis: 10.0
     useSorting: true
     quantileZ: 0.2
-    vehicleHeight: 1.0
+    vehicleHeight: 0.8                  # 只保留离地面估计值 0.8m 以内的点作为障碍物
     voxelPointUpdateThre: 100
     voxelTimeUpdateThre: 0.2
     lowerBoundZ: -1.5
-    upperBoundZ: 0.5
-    disRatioZ: 0.2
-    checkTerrainConn: False
+    upperBoundZ: 0.3                    # 收紧高度上界，减少天花板点进入（远处通过 disRatioZ 放宽）
+    disRatioZ: 0.1                      # 降低远处高度放宽比例，抑制远处天花板
+    checkTerrainConn: True              # 开启连通性检测，过滤天花板
     terrainUnderVehicle: -0.75
     terrainConnThre: 0.5
-    ceilingFilteringThre: 2.0
+    ceilingFilteringThre: 0.8           # 高差超过 1m 的体素视为天花板（原 2.0 太宽松）
     localTerrainMapRadius: 4.0
 
 fake_vel_transform:
@@ -742,7 +742,7 @@ local_costmap:
         z_voxels: 16
         min_obstacle_height: 0.0
         max_obstacle_height: 2.0
-        min_obstacle_intensity: 0.1
+        min_obstacle_intensity: 0.05    # 降低阈值（原 0.1），让 15cm 矮墙不被过滤
         max_obstacle_intensity: 2.0
         observation_sources: terrain_map
         terrain_map:
@@ -790,7 +790,7 @@ global_costmap:
         z_voxels: 16
         min_obstacle_height: 0.0
         max_obstacle_height: 2.0
-        min_obstacle_intensity: 0.1
+        min_obstacle_intensity: 0.05    # 降低阈值（原 0.1），让 15cm 矮墙不被过滤
         max_obstacle_intensity: 2.0
         observation_sources: terrain_map_ext
         terrain_map_ext:
