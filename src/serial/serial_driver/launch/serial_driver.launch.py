@@ -16,6 +16,7 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True,
         parameters=[config],
+        arguments=['--ros-args', '--log-level', 'rm_serial_driver:=debug'],
     )
 
     return LaunchDescription([rm_serial_driver_node])

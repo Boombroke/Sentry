@@ -109,6 +109,8 @@ void RMSerialDriver::receiveLoop()
         continue;
       }
 
+      RCLCPP_DEBUG(get_logger(), "RX packet 0x%02X (%zu bytes) CRC OK", hdr, data.size());
+
       switch (hdr) {
         case HEADER_IMU:
           handleImuPacket(fromVector<ReceiveImuPacket>(data));
@@ -184,6 +186,10 @@ void RMSerialDriver::sendNavData(const geometry_msgs::msg::Twist::SharedPtr msg)
 
     std::vector<uint8_t> data = toVector(packet);
     serial_driver_->port()->send(data);
+
+    RCLCPP_DEBUG(
+      get_logger(), "TX Nav: vx=%.3f vy=%.3f vw=%.3f (%zu bytes)",
+      packet.vel_x, packet.vel_y, packet.vel_w, data.size());
   } catch (const std::exception & ex) {
     RCLCPP_ERROR(get_logger(), "Error while sending data: %s", ex.what());
     reopenPort();

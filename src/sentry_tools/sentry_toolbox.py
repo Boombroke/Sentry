@@ -458,7 +458,7 @@ class SerialMockTab(QtWidgets.QWidget):
         self.refresh_port_button = QtWidgets.QPushButton('Refresh')
 
         self.baud_combo = QtWidgets.QComboBox()
-        for b in ['9600', '115200', '460800', '921600']:
+        for b in ['9600', '19200', '38400', '57600', '115200', '230400', '460800', '921600', '1000000', '2000000']:
             self.baud_combo.addItem(b)
         self.baud_combo.setCurrentText('115200')
 
@@ -1685,7 +1685,7 @@ class SerialDiagTab(QtWidgets.QWidget):
         self.refresh_port_button = QtWidgets.QPushButton('Refresh')
 
         self.baud_combo = QtWidgets.QComboBox()
-        for b in ['9600', '115200', '460800', '921600']:
+        for b in ['9600', '19200', '38400', '57600', '115200', '230400', '460800', '921600', '1000000', '2000000']:
             self.baud_combo.addItem(b)
         self.baud_combo.setCurrentText('115200')
 
@@ -2850,8 +2850,9 @@ class GravityCalibTab(QtWidgets.QWidget):
         top_bar.addSpacing(12)
         top_bar.addWidget(QtWidgets.QLabel('采样数'))
         self.sample_spin = QtWidgets.QSpinBox()
-        self.sample_spin.setRange(100, 5000)
-        self.sample_spin.setValue(1000)
+        self.sample_spin.setRange(1000, 20000)
+        self.sample_spin.setSingleStep(1000)
+        self.sample_spin.setValue(5000)
         top_bar.addWidget(self.sample_spin)
 
         top_bar.addSpacing(12)
@@ -2944,9 +2945,15 @@ class GravityCalibTab(QtWidgets.QWidget):
         self.acc_norm_combo.currentIndexChanged.connect(self._update_result_view)
         layout.addWidget(self.acc_norm_combo, 1, 1)
 
+        gravity_row = QtWidgets.QHBoxLayout()
         self.gravity_label = QtWidgets.QLabel('gravity: [--, --, --]')
         self.gravity_label.setStyleSheet('color: #e5e7eb; font-family: monospace; font-size: 13px;')
-        layout.addWidget(self.gravity_label, 2, 0, 1, 4)
+        self.copy_gravity_button = QtWidgets.QPushButton('复制')
+        self.copy_gravity_button.setFixedWidth(48)
+        self.copy_gravity_button.clicked.connect(self._copy_gravity_value)
+        gravity_row.addWidget(self.gravity_label, stretch=1)
+        gravity_row.addWidget(self.copy_gravity_button)
+        layout.addLayout(gravity_row, 2, 0, 1, 4)
 
         self.norm_label = QtWidgets.QLabel('norm: --')
         self.norm_label.setStyleSheet('color: #94a3b8; font-weight: 600;')
@@ -3126,6 +3133,28 @@ class GravityCalibTab(QtWidgets.QWidget):
 
     def _start_collection(self) -> None:
         topic = self.topic_edit.text().strip() or 'livox/imu'
+
+        if not self._one_click_active:
+            if shutil.which('ros2') is None:
+                QtWidgets.QMessageBox.warning(self, '采集失败', '未找到 ros2 命令，请先 source ROS2 环境')
+                return
+            try:
+                result = subprocess.run(
+                    ['ros2', 'topic', 'list'],
+                    capture_output=True, text=True, timeout=5,
+                )
+                full_topic = topic if topic.startswith('/') else f'/{topic}'
+                if full_topic not in result.stdout.splitlines():
+                    QtWidgets.QMessageBox.warning(
+                        self, '采集失败',
+                        f'话题 {full_topic} 不存在。\n\n'
+                        '请确保 IMU 驱动已启动，或使用「一键标定」自动拉起驱动。',
+                    )
+                    return
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, '采集失败', f'检查话题列表失败: {exc}')
+                return
+
         self.target_samples = int(self.sample_spin.value())
         self._reset_collection_state()
 
@@ -3276,6 +3305,16 @@ class GravityCalibTab(QtWidgets.QWidget):
 
         self.plot_canvas.draw_idle()
 
+    def _get_display_gravity(self) -> np.ndarray | None:
+        if self.final_gravity is None:
+            return None
+        g = self.final_gravity.copy()
+        raw_norm = float(np.linalg.norm(g))
+        expected_norm = float(self.acc_norm_combo.currentData())
+        if raw_norm > 1e-6:
+            g = g / raw_norm * expected_norm
+        return g
+
     def _update_result_view(self) -> None:
         if self.final_gravity is None:
             self.gravity_label.setText('gravity: [--, --, --]')
@@ -3283,7 +3322,7 @@ class GravityCalibTab(QtWidgets.QWidget):
             self.norm_label.setStyleSheet('color: #94a3b8; font-weight: 600;')
             return
 
-        g = self.final_gravity
+        g = self._get_display_gravity()
         self.gravity_label.setText(f'gravity: [{g[0]:.9f}, {g[1]:.9f}, {g[2]:.9f}]')
         norm = float(np.linalg.norm(g))
         expected_norm = float(self.acc_norm_combo.currentData())
@@ -3303,11 +3342,20 @@ class GravityCalibTab(QtWidgets.QWidget):
             f'gravity_init: [{g[0]:.9f}, {g[1]:.9f}, {g[2]:.9f}]'
         )
 
+    def _copy_gravity_value(self) -> None:
+        g = self._get_display_gravity()
+        if g is None:
+            return
+        text = f'[{g[0]:.9f}, {g[1]:.9f}, {g[2]:.9f}]'
+        QtWidgets.QApplication.clipboard().setText(text)
+        self._show_status_message('已复制 gravity 值到剪贴板')
+
     def _copy_yaml(self) -> None:
-        if self.final_gravity is None:
+        g = self._get_display_gravity()
+        if g is None:
             QtWidgets.QMessageBox.information(self, '无可复制数据', '请先完成采集后再复制 YAML。')
             return
-        text = self._format_yaml_text(self.final_gravity)
+        text = self._format_yaml_text(g)
         QtWidgets.QApplication.clipboard().setText(text)
         self._show_status_message('已复制 gravity YAML 到剪贴板')
 
