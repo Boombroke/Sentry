@@ -110,7 +110,57 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
-  loadGlobalMap(prior_pcd_file_);
+  loadPcdFile(prior_pcd_file_);
+
+  map_clearing_pub_ = this->create_publisher<std_msgs::msg::Float32>("map_clearing", 1);
+  cloud_clearing_pub_ = this->create_publisher<std_msgs::msg::Float32>("cloud_clearing", 1);
+
+  rclcpp::QoS latched_qos(1);
+  latched_qos.transient_local();
+  odom_to_lidar_odom_sub_ = this->create_subscription<geometry_msgs::msg::TransformStamped>(
+    "odom_to_lidar_odom", latched_qos,
+    std::bind(
+      &SmallGicpRelocalizationNode::odomToLidarOdomCallback, this, std::placeholders::_1));
+
+  pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+    "registered_scan", 10,
+    std::bind(&SmallGicpRelocalizationNode::registeredPcdCallback, this, std::placeholders::_1));
+
+  initial_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "initialpose", 10,
+    std::bind(&SmallGicpRelocalizationNode::initialPoseCallback, this, std::placeholders::_1));
+
+  transform_timer_ = this->create_wall_timer(
+    std::chrono::milliseconds(50),
+    std::bind(&SmallGicpRelocalizationNode::publishTransform, this));
+}
+
+void SmallGicpRelocalizationNode::loadPcdFile(const std::string & file_name)
+{
+  if (pcl::io::loadPCDFile<pcl::PointXYZ>(file_name, *global_map_) == -1) {
+    RCLCPP_ERROR(this->get_logger(), "Couldn't read PCD file: %s", file_name.c_str());
+    return;
+  }
+  RCLCPP_INFO(this->get_logger(), "Loaded global map with %zu points", global_map_->points.size());
+}
+
+void SmallGicpRelocalizationNode::odomToLidarOdomCallback(
+  const geometry_msgs::msg::TransformStamped::SharedPtr msg)
+{
+  if (global_map_ready_) {
+    return;
+  }
+  Eigen::Affine3d odom_to_lidar_odom = tf2::transformToEigen(msg->transform);
+  RCLCPP_INFO_STREAM(
+    this->get_logger(), "Received odom_to_lidar_odom from odom_bridge: translation = "
+                          << odom_to_lidar_odom.translation().transpose() << ", rpy = "
+                          << odom_to_lidar_odom.rotation().eulerAngles(0, 1, 2).transpose());
+  prepareTargetMap(odom_to_lidar_odom);
+}
+
+void SmallGicpRelocalizationNode::prepareTargetMap(const Eigen::Affine3d & odom_to_lidar_odom)
+{
+  pcl::transformPointCloud(*global_map_, *global_map_, odom_to_lidar_odom);
 
   target_ = small_gicp::voxelgrid_sampling_omp<
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
@@ -129,47 +179,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
     target_, small_gicp::KdTreeBuilderOMP(num_threads_));
 
-  map_clearing_pub_ = this->create_publisher<std_msgs::msg::Float32>("map_clearing", 1);
-  cloud_clearing_pub_ = this->create_publisher<std_msgs::msg::Float32>("cloud_clearing", 1);
-
-  pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    "registered_scan", 10,
-    std::bind(&SmallGicpRelocalizationNode::registeredPcdCallback, this, std::placeholders::_1));
-
-  initial_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-    "initialpose", 10,
-    std::bind(&SmallGicpRelocalizationNode::initialPoseCallback, this, std::placeholders::_1));
-
-  transform_timer_ = this->create_wall_timer(
-    std::chrono::milliseconds(50),
-    std::bind(&SmallGicpRelocalizationNode::publishTransform, this));
-}
-
-void SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
-{
-  if (pcl::io::loadPCDFile<pcl::PointXYZ>(file_name, *global_map_) == -1) {
-    RCLCPP_ERROR(this->get_logger(), "Couldn't read PCD file: %s", file_name.c_str());
-    return;
-  }
-  RCLCPP_INFO(this->get_logger(), "Loaded global map with %zu points", global_map_->points.size());
-
-  Eigen::Affine3d odom_to_lidar_odom;
-  while (true) {
-    try {
-      auto tf_stamped = tf_buffer_->lookupTransform(
-        base_frame_, lidar_frame_, this->now(), rclcpp::Duration::from_seconds(1.0));
-      odom_to_lidar_odom = tf2::transformToEigen(tf_stamped.transform);
-      RCLCPP_INFO_STREAM(
-        this->get_logger(), "odom_to_lidar_odom: translation = "
-                              << odom_to_lidar_odom.translation().transpose() << ", rpy = "
-                              << odom_to_lidar_odom.rotation().eulerAngles(0, 1, 2).transpose());
-      break;
-    } catch (tf2::TransformException & ex) {
-      RCLCPP_WARN(this->get_logger(), "TF lookup failed: %s Retrying...", ex.what());
-      rclcpp::sleep_for(std::chrono::seconds(1));
-    }
-  }
-  pcl::transformPointCloud(*global_map_, *global_map_, odom_to_lidar_odom);
+  global_map_ready_ = true;
 }
 
 void SmallGicpRelocalizationNode::registeredPcdCallback(
@@ -177,6 +187,10 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
 {
   last_scan_time_ = msg->header.stamp;
   current_scan_frame_id_ = msg->header.frame_id;
+
+  if (!global_map_ready_) {
+    return;
+  }
 
   if (has_localized_ && !enable_periodic_relocalization_) {
     return;

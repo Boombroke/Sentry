@@ -41,6 +41,11 @@ OdomBridgeNode::OdomBridgeNode(const rclcpp::NodeOptions & options)
   registered_scan_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("registered_scan", 5);
   lidar_odometry_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("lidar_odometry", 5);
 
+  rclcpp::QoS latched_qos(1);
+  latched_qos.transient_local();
+  odom_to_lidar_odom_pub_ =
+    this->create_publisher<geometry_msgs::msg::TransformStamped>("odom_to_lidar_odom", latched_qos);
+
   rmw_qos_profile_t qos_profile = rmw_qos_profile_default;
   qos_profile.depth = 5;
   qos_profile.reliability = RMW_QOS_POLICY_RELIABILITY_SYSTEM_DEFAULT;
@@ -68,6 +73,13 @@ void OdomBridgeNode::lidarOdometryAndPointCloudCallback(
       tf2::fromMsg(tf_stamped.transform, tf_base_frame_to_lidar);
       tf_odom_to_lidar_odom_ = tf_base_frame_to_lidar;
       base_frame_to_lidar_initialized_ = true;
+
+      geometry_msgs::msg::TransformStamped msg;
+      msg.header.stamp = odometry_msg->header.stamp;
+      msg.header.frame_id = odom_frame_;
+      msg.child_frame_id = "lidar_odom";
+      msg.transform = tf2::toMsg(tf_odom_to_lidar_odom_);
+      odom_to_lidar_odom_pub_->publish(msg);
     } catch (tf2::TransformException & ex) {
       RCLCPP_WARN(this->get_logger(), "TF lookup failed: %s. Retrying...", ex.what());
       return;

@@ -8,6 +8,7 @@
 #include "message_filters/subscriber.h"
 #include "message_filters/sync_policies/approximate_time.h"
 #include "message_filters/synchronizer.h"
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
@@ -53,9 +54,9 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr sensor_scan_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
-  // Equivalent to old loam_interface outputs (odom frame), consumed by terrain_analysis/ext
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr registered_scan_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr lidar_odometry_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr odom_to_lidar_odom_pub_;
 
   message_filters::Subscriber<nav_msgs::msg::Odometry> odometry_sub_;
   message_filters::Subscriber<sensor_msgs::msg::PointCloud2> registered_scan_sub_;

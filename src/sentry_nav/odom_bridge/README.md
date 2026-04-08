@@ -27,6 +27,7 @@
 - `odometry` (`nav_msgs/msg/Odometry`，odom -> robot_base_frame，含位置差分速度)
 - `registered_scan` (`sensor_msgs/msg/PointCloud2`，odom 系点云，供 terrain_analysis/ext)
 - `lidar_odometry` (`nav_msgs/msg/Odometry`，odom -> lidar_frame，供 terrain_analysis/ext)
+- `odom_to_lidar_odom` (`geometry_msgs/msg/TransformStamped`，latched，odom -> lidar_odom 的静态偏移，供 small_gicp_relocalization 使用，确保与 registered_scan 的坐标变换一致)
 
 ## TF 发布
 
