@@ -71,7 +71,14 @@ void OdomBridgeNode::lidarOdometryAndPointCloudCallback(
         rclcpp::Duration::from_seconds(0.5));
       tf2::Transform tf_base_frame_to_lidar;
       tf2::fromMsg(tf_stamped.transform, tf_base_frame_to_lidar);
-      tf_odom_to_lidar_odom_ = tf_base_frame_to_lidar;
+
+      // Point-LIO first frame pose = rot_init (gravity alignment rotation).
+      // lidar_odom frame is rotated by rot_init relative to the physical lidar frame at t=0.
+      // Compensate: odom→lidar_odom = (base→lidar) * rot_init_inverse
+      tf2::Transform tf_lidar_odom_to_lidar_t0;
+      tf2::fromMsg(odometry_msg->pose.pose, tf_lidar_odom_to_lidar_t0);
+      tf_odom_to_lidar_odom_ = tf_base_frame_to_lidar * tf_lidar_odom_to_lidar_t0.inverse();
+
       base_frame_to_lidar_initialized_ = true;
 
       geometry_msgs::msg::TransformStamped msg;
