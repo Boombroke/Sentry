@@ -19,6 +19,7 @@
 
 #include "rm_serial_driver/packet.hpp"
 
+#include <fstream>
 #include <future>
 #include <memory>
 #include <string>
@@ -57,6 +58,9 @@ private:
   rclcpp::Publisher<rm_interfaces::msg::RfidStatus>::SharedPtr rfid_pub_;
 
   std::thread receive_thread_;
+
+  bool enable_vel_log_{false};
+  std::ofstream vel_log_file_;
 };
 }  // namespace rm_serial_driver
 

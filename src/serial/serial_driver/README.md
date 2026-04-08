@@ -72,6 +72,7 @@ serial/serial_driver/
 | flow_control | none | 流控模式 |
 | parity | none | 校验位 |
 | stop_bits | "1" | 停止位 |
+| enable_vel_log | false | 启用速度下发 CSV 日志（详见第 11 节） |
 
 ## 6. 编译与使用
 
@@ -134,3 +135,62 @@ ros2 launch rm_serial_driver serial_driver.launch.py device_name:=/dev/ttyUSB0
 - 驱动具备自动重连机制，串口断开后会以 1s 为间隔尝试重新打开设备。
 - 本包特有的 CMake 配置将 C++ 标准设为 C++14（项目其他包通常使用 C++17）。
 - `package.xml` 中保留了部分历史遗留的未使用依赖（如 `auto_nav_interfaces`, `visualization_msgs` 等）。
+
+## 11. 速度日志
+
+用于调试速度毛刺、突变等问题。启用后在串口发送前记录每帧 `vel_x`, `vel_y`, `vel_w` 到 CSV 文件，便于离线波形分析。
+
+### 启用方式
+
+在 `nav2_params.yaml` 中：
+
+```yaml
+rm_serial_driver:
+  ros__parameters:
+    enable_vel_log: true
+```
+
+或 launch 参数覆盖：
+
+```bash
+ros2 launch rm_serial_driver serial_driver.launch.py enable_vel_log:=true
+```
+
+### 日志位置
+
+`/tmp/vel_log_<启动时间戳>.csv`，节点启动时打印完整路径。
+
+### CSV 格式
+
+```csv
+timestamp_ns,vel_x,vel_y,vel_w
+1712345678000000000,1.23,-0.45,3.14
+```
+
+- `timestamp_ns`：ROS 时间（纳秒）
+- `vel_x`, `vel_y`：body 系线速度（m/s），经 fake_vel_transform 旋转 + spin_speed 叠加后的最终值
+- `vel_w`：角速度（rad/s），含 spin_speed
+
+### 离线分析
+
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df = pd.read_csv('/tmp/vel_log_xxx.csv')
+df['t'] = (df['timestamp_ns'] - df['timestamp_ns'].iloc[0]) / 1e9
+
+fig, axes = plt.subplots(3, 1, sharex=True, figsize=(12, 6))
+for i, col in enumerate(['vel_x', 'vel_y', 'vel_w']):
+    axes[i].plot(df['t'], df[col], linewidth=0.5)
+    axes[i].set_ylabel(col)
+    axes[i].grid(True, alpha=0.3)
+axes[2].set_xlabel('time (s)')
+plt.tight_layout()
+plt.savefig('vel_debug.png', dpi=150)
+plt.show()
+```
+
+### 性能影响
+
+默认关闭（`enable_vel_log: false`），零开销。启用后 50Hz 写入约 2KB/s，对实时性无影响。调试完毕后建议关闭。

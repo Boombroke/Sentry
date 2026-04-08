@@ -26,6 +26,16 @@ RMSerialDriver::RMSerialDriver(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(get_logger(), "Start RMSerialDriver!");
   getParams();
 
+  this->declare_parameter<bool>("enable_vel_log", false);
+  this->get_parameter("enable_vel_log", enable_vel_log_);
+  if (enable_vel_log_) {
+    std::string log_path = "/tmp/vel_log_" +
+      std::to_string(this->now().nanoseconds()) + ".csv";
+    vel_log_file_.open(log_path);
+    vel_log_file_ << "timestamp_ns,vel_x,vel_y,vel_w\n";
+    RCLCPP_INFO(get_logger(), "Velocity logging enabled: %s", log_path.c_str());
+  }
+
   cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
     "/cmd_vel", 10,
     std::bind(&RMSerialDriver::sendNavData, this, std::placeholders::_1));
@@ -56,6 +66,9 @@ RMSerialDriver::RMSerialDriver(const rclcpp::NodeOptions & options)
 
 RMSerialDriver::~RMSerialDriver()
 {
+  if (vel_log_file_.is_open()) {
+    vel_log_file_.close();
+  }
   if (receive_thread_.joinable()) {
     receive_thread_.join();
   }
@@ -161,6 +174,11 @@ void RMSerialDriver::sendNavData(const geometry_msgs::msg::Twist::SharedPtr msg)
     packet.vel_x = msg->linear.x;
     packet.vel_y = msg->linear.y;
     packet.vel_w = msg->angular.z;
+
+    if (enable_vel_log_ && vel_log_file_.is_open()) {
+      vel_log_file_ << this->now().nanoseconds() << ','
+                    << packet.vel_x << ',' << packet.vel_y << ',' << packet.vel_w << '\n';
+    }
 
     crc16::Append_CRC16_Check_Sum(reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
 
