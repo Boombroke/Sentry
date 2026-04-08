@@ -18,6 +18,7 @@
 #include <cmath>
 
 #include "nav2_core/exceptions.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "nav2_util/geometry_utils.hpp"
 #include "nav2_util/node_utils.hpp"
 
@@ -381,22 +382,29 @@ nav_msgs::msg::Path OmniPidPursuitController::transformGlobalPlan(
     transformation_begin, global_plan_.poses.end(),
     [&](const auto & pose) { return euclidean_distance(pose, robot_pose) > max_costmap_extent; });
 
-  // Lambda to transform a PoseStamped from global frame to local
-  auto transform_global_pose_to_local = [&](const auto & global_plan_pose) {
+  // Look up the transform once, then apply to all poses (avoid per-pose TF lookup)
+  geometry_msgs::msg::TransformStamped tf_stamped;
+  try {
+    tf_stamped = tf_->lookupTransform(
+      costmap_ros_->getBaseFrameID(), global_plan_.header.frame_id,
+      robot_pose.header.stamp, transform_tolerance_);
+  } catch (tf2::TransformException & ex) {
+    throw nav2_core::PlannerException(
+      std::string("Unable to lookup transform for plan: ") + ex.what());
+  }
+
+  nav_msgs::msg::Path transformed_plan;
+  transformed_plan.poses.reserve(
+    std::distance(transformation_begin, transformation_end));
+  for (auto it = transformation_begin; it != transformation_end; ++it) {
     geometry_msgs::msg::PoseStamped stamped_pose, transformed_pose;
     stamped_pose.header.frame_id = global_plan_.header.frame_id;
     stamped_pose.header.stamp = robot_pose.header.stamp;
-    stamped_pose.pose = global_plan_pose.pose;
-    transformPose(costmap_ros_->getBaseFrameID(), stamped_pose, transformed_pose);
+    stamped_pose.pose = it->pose;
+    tf2::doTransform(stamped_pose, transformed_pose, tf_stamped);
     transformed_pose.pose.position.z = 0.0;
-    return transformed_pose;
-  };
-
-  // Transform the near part of the global plan into the robot's frame of reference.
-  nav_msgs::msg::Path transformed_plan;
-  std::transform(
-    transformation_begin, transformation_end, std::back_inserter(transformed_plan.poses),
-    transform_global_pose_to_local);
+    transformed_plan.poses.push_back(transformed_pose);
+  }
   transformed_plan.header.frame_id = costmap_ros_->getBaseFrameID();
   transformed_plan.header.stamp = robot_pose.header.stamp;
 
