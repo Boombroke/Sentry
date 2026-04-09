@@ -28,9 +28,9 @@ point_lio:
     prop_at_freq_of_imu: True
     check_satu: True
     init_map_size: 10
-    point_filter_num: 4                                 # Options: 4, 3
+    point_filter_num: 2
     space_down_sample: True
-    filter_size_surf: 0.2                               # Options: 0.5, 0.3, 0.2, 0.15, 0.1
+    filter_size_surf: 0.15
     filter_size_map: 0.2                                # Options: 0.5, 0.3, 0.15, 0.1
     ivox_nearby_type: 18                                # Options: 0, 6, 18, 26
     runtime_pos_log_enable: False                       # Option: True
@@ -133,8 +133,8 @@ terrain_analysis:
     voxelPointUpdateThre: 100
     voxelTimeUpdateThre: 0.5
     minRelZ: -1.5                       # min_rel_z 以及 max_rel_z 限制了有效点云点的Z值范围，用于对天花板和地板进行处理
-    maxRelZ: 0.3                        # 收紧上界（原 0.5），配合 disRatioZ 减少远处天花板
-    disRatioZ: 0.1                      # 降低远处高度放宽比例（原 0.2），抑制远处天花板点
+    maxRelZ: 1.0
+    disRatioZ: 0.2
 
 terrain_analysis_ext:
   ros__parameters:
@@ -148,9 +148,9 @@ terrain_analysis_ext:
     voxelPointUpdateThre: 100
     voxelTimeUpdateThre: 0.2
     lowerBoundZ: -1.5
-    upperBoundZ: 0.3                    # 收紧高度上界，减少天花板点进入（远处通过 disRatioZ 放宽）
-    disRatioZ: 0.1                      # 降低远处高度放宽比例，抑制远处天花板
-    checkTerrainConn: True              # 开启连通性检测，过滤天花板
+    upperBoundZ: 1.0
+    disRatioZ: 0.2
+    checkTerrainConn: True
     terrainUnderVehicle: -0.75
     terrainConnThre: 0.5
     ceilingFilteringThre: 0.8           # 高差超过 1m 的体素视为天花板（原 2.0 太宽松）
