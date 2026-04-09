@@ -1,5 +1,6 @@
 // #include <so3_math.h>
 #include <malloc.h>
+#include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
@@ -7,7 +8,9 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
+#include <tf2_eigen/tf2_eigen.hpp>
 
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 
@@ -179,6 +182,8 @@ void publish_init_map(
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+Eigen::Affine3d g_odom_to_lidar_odom = Eigen::Affine3d::Identity();
+bool g_odom_to_lidar_odom_received = false;
 void publish_frame_world(
   const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pubLaserCloudFullRes)
 {
@@ -401,6 +406,17 @@ int main(int argc, char ** argv)
     nh->create_publisher<nav_msgs::msg::Odometry>("aft_mapped_to_init", 20);
   auto pub_path = nh->create_publisher<nav_msgs::msg::Path>("path", 20);
   auto tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(nh);
+
+  rclcpp::QoS latched_qos(1);
+  latched_qos.transient_local();
+  auto sub_odom_to_lidar_odom =
+    nh->create_subscription<geometry_msgs::msg::TransformStamped>(
+      "odom_to_lidar_odom", latched_qos,
+      [](const geometry_msgs::msg::TransformStamped::SharedPtr msg) {
+        g_odom_to_lidar_odom = tf2::transformToEigen(msg->transform);
+        g_odom_to_lidar_odom_received = true;
+        std::cout << "Received odom_to_lidar_odom transform for PCD save" << '\n';
+      });
 
   //------------------------------------------------------------------------------------------------------
   signal(SIGINT, SigHandle);
@@ -1042,6 +1058,13 @@ int main(int argc, char ** argv)
   // 1. make sure you have enough memories
   // 2. noted that pcd save will influence the real-time performances
   if (!pcl_wait_save->empty() && pcd_save_en) {
+    if (g_odom_to_lidar_odom_received) {
+      pcl::transformPointCloud(*pcl_wait_save, *pcl_wait_save,
+                               g_odom_to_lidar_odom.cast<float>().matrix());
+      std::cout << "PCD transformed to odom frame before saving" << '\n';
+    } else {
+      std::cout << "WARNING: odom_to_lidar_odom not received, PCD saved in lidar_odom frame" << '\n';
+    }
     string file_name = string("scans.pcd");
     string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
     pcl::PCDWriter pcd_writer;
