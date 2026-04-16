@@ -3,7 +3,7 @@
 # Sentry Nav - ROS2 哨兵导航系统
 
 ## 项目概述
-本项目是为 RoboMaster 比赛哨兵机器人开发的 ROS2 导航系统。系统基于 ROS2 Humble 和 Ubuntu 22.04 构建，集成了定位、感知、规划与决策功能。该系统参考深圳北理莫斯科大学 PolarBear 战队开发。
+本项目是为 RoboMaster 比赛哨兵机器人开发的 ROS2 导航系统。系统基于 ROS2 Jazzy 和 Ubuntu 24.04 构建，集成了定位、感知、规划与决策功能。该系统参考深圳北理莫斯科大学 PolarBear 战队导航框架进行开发。
 
 ## 系统架构
 系统架构包含以下核心模块：
